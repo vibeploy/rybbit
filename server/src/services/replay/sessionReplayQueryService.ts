@@ -165,7 +165,7 @@ export class SessionReplayQueryService {
 
     const eventsResults = await processResults<EventRow>(eventsResult);
 
-    // Group events by batch key for efficient R2 retrieval
+    // Group events by batch key for efficient object storage retrieval.
     const eventsByBatch = new Map<string | null, EventRow[]>();
     eventsResults.forEach(event => {
       const key = event.event_data_key;
@@ -178,7 +178,7 @@ export class SessionReplayQueryService {
     // Process batches and reconstruct events
     const events = [];
 
-    // Separate R2 and ClickHouse batches
+    // Separate object storage and ClickHouse batches.
     const r2Batches: Array<[string, EventRow[]]> = [];
     const clickhouseBatches: Array<[string | null, EventRow[]]> = [];
 
@@ -201,7 +201,7 @@ export class SessionReplayQueryService {
       }
     }
 
-    // Fetch R2 batches in parallel (with increased concurrency for better throughput)
+    // Fetch object storage batches in parallel.
     const PARALLEL_BATCH_SIZE = 50;
     const r2Results: Array<{ batchKey: string; batchEvents: EventRow[]; data: any[] | null }> = [];
 
@@ -213,7 +213,7 @@ export class SessionReplayQueryService {
           const eventDataArray = await r2Storage.getBatch(batchKey);
           return { batchKey, batchEvents, data: eventDataArray };
         } catch (error) {
-          console.error(`Failed to fetch R2 batch ${batchKey}:`, error);
+          console.error(`Failed to fetch replay batch ${batchKey} from object storage:`, error);
           return { batchKey, batchEvents, data: null };
         }
       });
@@ -222,7 +222,7 @@ export class SessionReplayQueryService {
       r2Results.push(...results);
     }
 
-    // Process R2 results
+    // Process object storage results.
     for (const { batchEvents, data } of r2Results) {
       if (data) {
         for (const event of batchEvents) {
@@ -269,10 +269,10 @@ export class SessionReplayQueryService {
    * This includes:
    * - Events from session_replay_events table
    * - Metadata from session_replay_metadata table
-   * - R2 stored data (if enabled)
+   * - Object storage data (if enabled)
    */
   async deleteSessionReplay(siteId: number, sessionId: string): Promise<void> {
-    // First, get all R2 keys for this session if R2 is enabled
+    // First, get all object keys for this session if object storage is enabled.
     if (r2Storage.isEnabled()) {
       try {
         const r2KeysResult = await clickhouse.query({
@@ -289,10 +289,10 @@ export class SessionReplayQueryService {
 
         const r2Keys = await processResults<{ event_data_key: string }>(r2KeysResult);
 
-        // Delete all R2 batches in parallel
+        // Delete all object storage batches in parallel.
         await Promise.all(r2Keys.map(row => r2Storage.deleteBatch(row.event_data_key)));
       } catch (error) {
-        console.error(`Failed to delete R2 data for session ${sessionId}:`, error);
+        console.error(`Failed to delete object storage data for session ${sessionId}:`, error);
         // Continue with ClickHouse deletion even if R2 fails
       }
     }
