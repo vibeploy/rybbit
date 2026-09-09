@@ -58,11 +58,44 @@ vi.mock("../../lib/logger/logger.js", () => ({
   createServiceLogger: () => mocks.logger,
 }));
 
-async function loadStorage(options: { cloud?: boolean; accessKey?: string; secretKey?: string; bucket?: string } = {}) {
+async function loadStorage(
+  options: {
+    cloud?: boolean;
+    accessKey?: string;
+    secretKey?: string;
+    bucket?: string;
+    enabled?: string;
+    endpoint?: string;
+    region?: string;
+    forcePathStyle?: string;
+    genericCredentials?: boolean;
+  } = {}
+) {
   state.isCloud = options.cloud ?? true;
+  if (options.enabled !== undefined) {
+    vi.stubEnv("SESSION_REPLAY_S3_ENABLED", options.enabled);
+  }
+  if (options.endpoint !== undefined) {
+    vi.stubEnv("SESSION_REPLAY_S3_ENDPOINT", options.endpoint);
+  }
+  if (options.region !== undefined) {
+    vi.stubEnv("SESSION_REPLAY_S3_REGION", options.region);
+  }
+  if (options.forcePathStyle !== undefined) {
+    vi.stubEnv("SESSION_REPLAY_S3_FORCE_PATH_STYLE", options.forcePathStyle);
+  }
+  if (options.genericCredentials) {
+    vi.stubEnv("SESSION_REPLAY_S3_ACCESS_KEY_ID", options.accessKey ?? "access-key");
+    vi.stubEnv("SESSION_REPLAY_S3_SECRET_ACCESS_KEY", options.secretKey ?? "secret-key");
+    vi.stubEnv("SESSION_REPLAY_S3_BUCKET", options.bucket ?? "test-bucket");
+    vi.stubEnv("R2_ACCESS_KEY_ID", "");
+    vi.stubEnv("R2_SECRET_ACCESS_KEY", "");
+  }
   vi.stubEnv("R2_ACCOUNT_ID", "account-123");
-  vi.stubEnv("R2_ACCESS_KEY_ID", options.accessKey ?? "access-key");
-  vi.stubEnv("R2_SECRET_ACCESS_KEY", options.secretKey ?? "secret-key");
+  if (!options.genericCredentials) {
+    vi.stubEnv("R2_ACCESS_KEY_ID", options.accessKey ?? "access-key");
+    vi.stubEnv("R2_SECRET_ACCESS_KEY", options.secretKey ?? "secret-key");
+  }
   vi.stubEnv("R2_BUCKET_NAME", options.bucket ?? "test-bucket");
   vi.resetModules();
 
@@ -127,7 +160,59 @@ describe("r2Storage initialization", () => {
       credentials: { accessKeyId: "access-key", secretAccessKey: "secret-key" },
       forcePathStyle: true,
     });
-    expect(mocks.logger.info).toHaveBeenCalledWith({ bucket: "replay-batches" }, "R2Storage initialized");
+    expect(mocks.logger.info).toHaveBeenCalledWith(
+      {
+        bucket: "replay-batches",
+        endpoint: "https://account-123.r2.cloudflarestorage.com",
+      },
+      "Session replay object storage initialized"
+    );
+  });
+
+  it("configures an S3-compatible endpoint outside the hosted cloud", async () => {
+    const storage = await loadStorage({
+      cloud: false,
+      enabled: "true",
+      endpoint: "http://silo.storage.svc.cluster.local:9000",
+      region: "us-east-1",
+      bucket: "session-replays",
+      genericCredentials: true,
+    });
+
+    expect(storage.isEnabled()).toBe(true);
+    expect(mocks.clientConfigs[0]).toMatchObject({
+      region: "us-east-1",
+      endpoint: "http://silo.storage.svc.cluster.local:9000",
+      credentials: { accessKeyId: "access-key", secretAccessKey: "secret-key" },
+      forcePathStyle: true,
+    });
+    expect(mocks.logger.info).toHaveBeenCalledWith(
+      {
+        bucket: "session-replays",
+        endpoint: "http://silo.storage.svc.cluster.local:9000",
+      },
+      "Session replay object storage initialized"
+    );
+  });
+
+  it("can explicitly disable legacy R2 configuration", async () => {
+    const storage = await loadStorage({ enabled: "false" });
+
+    expect(storage.isEnabled()).toBe(false);
+    expect(mocks.clientConfigs).toHaveLength(0);
+  });
+
+  it("supports virtual-hosted-style requests when explicitly requested", async () => {
+    const storage = await loadStorage({
+      cloud: false,
+      enabled: "true",
+      endpoint: "https://objects.example.com",
+      forcePathStyle: "false",
+      genericCredentials: true,
+    });
+
+    expect(storage.isEnabled()).toBe(true);
+    expect(mocks.clientConfigs[0].forcePathStyle).toBe(false);
   });
 
   it("strips checksum response headers without discarding other handler output", async () => {
@@ -202,7 +287,7 @@ describe("r2Storage.storeBatch", () => {
 
     await expect(storage.storeBatch(1, "session", [{}])).rejects.toBe(compressionError);
     expect(mocks.send).not.toHaveBeenCalled();
-    expect(console.error).toHaveBeenCalledWith("[R2Storage] Failed to store batch:", compressionError);
+    expect(console.error).toHaveBeenCalledWith("[ReplayStorage] Failed to store batch:", compressionError);
   });
 
   it("propagates object-store failures after compression", async () => {
@@ -212,7 +297,7 @@ describe("r2Storage.storeBatch", () => {
 
     await expect(storage.storeBatch(1, "session", [{}])).rejects.toBe(putError);
     expect(mocks.compress).toHaveBeenCalledOnce();
-    expect(console.error).toHaveBeenCalledWith("[R2Storage] Failed to store batch:", putError);
+    expect(console.error).toHaveBeenCalledWith("[ReplayStorage] Failed to store batch:", putError);
   });
 
   it("allows independent stores to progress concurrently", async () => {
@@ -291,7 +376,7 @@ describe("r2Storage.getBatch", () => {
 
     await expect(storage.getBatch("missing.json.zst")).rejects.toThrow("Empty response body");
     expect(console.error).toHaveBeenCalledWith(
-      "[R2Storage] Failed to retrieve batch:",
+      "[ReplayStorage] Failed to retrieve batch:",
       expect.objectContaining({ message: "Empty response body" })
     );
   });
@@ -303,7 +388,7 @@ describe("r2Storage.getBatch", () => {
     const storage = await loadStorage();
 
     await expect(storage.getBatch("corrupt.json.zst")).rejects.toBe(codecError);
-    expect(console.error).toHaveBeenCalledWith("[R2Storage] Failed to retrieve batch:", codecError);
+    expect(console.error).toHaveBeenCalledWith("[ReplayStorage] Failed to retrieve batch:", codecError);
   });
 
   it("propagates object-store read failures", async () => {
@@ -330,6 +415,6 @@ describe("r2Storage.deleteBatch", () => {
     const storage = await loadStorage();
 
     await expect(storage.deleteBatch("1/session/batch.json.zst")).resolves.toBeUndefined();
-    expect(console.error).toHaveBeenCalledWith("[R2Storage] Failed to delete batch:", deleteError);
+    expect(console.error).toHaveBeenCalledWith("[ReplayStorage] Failed to delete batch:", deleteError);
   });
 });
