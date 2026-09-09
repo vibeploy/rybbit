@@ -70,19 +70,19 @@ export class SessionReplayIngestService {
       siteId,
     });
 
-    // Check if R2 storage is enabled for cloud deployments
+    // Check if S3-compatible object storage is enabled.
     let r2BatchKey: string | null = null;
     let eventDataArray: any[] = [];
 
     if (r2Storage.isEnabled()) {
-      // Extract event data for R2 storage
+      // Extract event data for object storage.
       eventDataArray = events.map(event => event.data);
 
       try {
-        // Store event data batch in R2
+        // Store the event data batch outside ClickHouse.
         r2BatchKey = await r2Storage.storeBatch(siteId, sessionId, eventDataArray);
       } catch (error) {
-        console.error("Failed to store in R2, falling back to ClickHouse:", error);
+        console.error("Failed to store replay batch in object storage, falling back to ClickHouse:", error);
         r2BatchKey = null;
       }
     }
@@ -92,7 +92,7 @@ export class SessionReplayIngestService {
       const serializedData = JSON.stringify(event.data);
 
       if (r2BatchKey) {
-        // R2 storage: store metadata only in ClickHouse
+        // Object storage: store metadata only in ClickHouse.
         return {
           site_id: siteId,
           session_id: sessionId,
@@ -154,15 +154,7 @@ export class SessionReplayIngestService {
         screenHeight: metadata.viewportHeight || 0,
       };
 
-      await this.updateSessionMetadata(
-        siteId,
-        sessionId,
-        userId,
-        identifiedUserId,
-        metadata,
-        batchStats,
-        requestMeta
-      );
+      await this.updateSessionMetadata(siteId, sessionId, userId, identifiedUserId, metadata, batchStats, requestMeta);
     }
   }
 
