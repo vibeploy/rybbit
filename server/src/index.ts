@@ -108,6 +108,7 @@ import {
   getSessionReplays,
   recordSessionReplay,
 } from "./api/sessionReplay/index.js";
+import { SESSION_REPLAY_BODY_LIMIT_BYTES } from "./api/sessionReplay/bodyLimit.js";
 import {
   addSite,
   batchImportEvents,
@@ -419,7 +420,7 @@ async function analyticsRoutes(fastify: FastifyInstance) {
 
 async function sessionReplayRoutes(fastify: FastifyInstance) {
   // Session Replay
-  fastify.post("/session-replay/record/:siteId", recordSessionReplay); // Public - tracking endpoint
+  fastify.post("/session-replay/record/:siteId", { bodyLimit: SESSION_REPLAY_BODY_LIMIT_BYTES }, recordSessionReplay); // Public - tracking endpoint
   fastify.get("/sites/:siteId/session-replay/list", publicReplayRead, getSessionReplays);
   fastify.get("/sites/:siteId/session-replay/:sessionId", publicReplayRead, getSessionReplayEvents);
   fastify.delete("/sites/:siteId/session-replay/:sessionId", authReplayWrite, deleteSessionReplay);
