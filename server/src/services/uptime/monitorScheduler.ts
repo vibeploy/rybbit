@@ -2,6 +2,7 @@ import { Queue, QueueEvents } from "bullmq";
 import { eq } from "drizzle-orm";
 import { db } from "../../db/postgres/postgres.js";
 import { uptimeMonitors } from "../../db/postgres/schema.js";
+import { getRedisConnectionOptions } from "../../db/redis/redisConnectionOptions.js";
 import { createServiceLogger } from "../../lib/logger/logger.js";
 import { MonitorCheckJob } from "./types.js";
 
@@ -9,18 +10,19 @@ export class MonitorScheduler {
   private queue: Queue;
   private queueEvents: QueueEvents;
   private isShuttingDown = false;
-  private connection: { host: string; port: number; password?: string };
+  private connection: ReturnType<typeof getRedisConnectionOptions>;
   private logger = createServiceLogger("monitor-scheduler");
 
   constructor() {
-    // Get Redis connection from environment
-    this.connection = {
-      host: process.env.REDIS_HOST || "localhost",
-      port: parseInt(process.env.REDIS_PORT || "6379", 10),
-      ...(process.env.REDIS_PASSWORD && { password: process.env.REDIS_PASSWORD }),
-    };
+    this.connection = getRedisConnectionOptions();
 
-    this.logger.info({ host: this.connection.host, port: this.connection.port }, "BullMQ connecting to Redis");
+    this.logger.info(
+      {
+        mode: this.connection.sentinels ? "sentinel" : "standalone",
+        endpointCount: this.connection.sentinels?.length ?? 1,
+      },
+      "BullMQ connecting to Redis"
+    );
 
     this.queue = new Queue("monitor-checks", {
       connection: this.connection,

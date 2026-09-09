@@ -3,6 +3,7 @@ import { eq, and, inArray } from "drizzle-orm";
 import { DateTime } from "luxon";
 import { db } from "../../db/postgres/postgres.js";
 import { uptimeMonitors, uptimeMonitorStatus, agentRegions, uptimeIncidents } from "../../db/postgres/schema.js";
+import { getRedisConnectionOptions } from "../../db/redis/redisConnectionOptions.js";
 import { clickhouse } from "../../db/clickhouse/clickhouse.js";
 import { MonitorCheckJob, HttpCheckResult, TcpCheckResult, MonitorEvent } from "./types.js";
 import { performHttpCheck } from "./checks/httpCheck.js";
@@ -45,7 +46,7 @@ export class MonitorExecutor {
   private worker: Worker | null = null;
   private concurrency: number;
   private isShuttingDown = false;
-  private connection: { host: string; port: number; password?: string };
+  private connection: ReturnType<typeof getRedisConnectionOptions>;
   private notificationService: NotificationService;
   private logger = createServiceLogger("monitor-executor");
 
@@ -55,11 +56,7 @@ export class MonitorExecutor {
 
   constructor(concurrency: number = 10) {
     this.concurrency = concurrency;
-    this.connection = {
-      host: process.env.REDIS_HOST || "localhost",
-      port: parseInt(process.env.REDIS_PORT || "6379", 10),
-      ...(process.env.REDIS_PASSWORD && { password: process.env.REDIS_PASSWORD }),
-    };
+    this.connection = getRedisConnectionOptions();
     this.notificationService = new NotificationService();
   }
 
