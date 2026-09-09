@@ -1,5 +1,6 @@
 import { Redis } from "ioredis";
 import { createServiceLogger } from "../../lib/logger/logger.js";
+import { RELEASE_REPLAY_METADATA_LOCK_LUA } from "./replayMetadataLockLua.js";
 import { STICKY_RESOLVE_LUA } from "./stickyResolveLua.js";
 
 const logger = createServiceLogger("redis");
@@ -79,6 +80,27 @@ interface SessionRedis extends Redis {
  */
 export function sessionGetOrCreate(key: string, candidateId: string, ttlMs: number): Promise<string> {
   return (sessionRedis as SessionRedis).sessionGetOrCreate(key, candidateId, ttlMs);
+}
+
+// Metadata snapshots are updated by every replay batch. A dedicated connection
+// keeps this short critical section isolated from session and anomaly traffic.
+export const replayMetadataRedis = createRedisClient("replay-metadata");
+
+replayMetadataRedis.defineCommand("releaseReplayMetadataLock", {
+  numberOfKeys: 1,
+  lua: RELEASE_REPLAY_METADATA_LOCK_LUA,
+});
+
+interface ReplayMetadataRedis extends Redis {
+  releaseReplayMetadataLock(key: string, token: string): Promise<number>;
+}
+
+export async function tryAcquireReplayMetadataLock(key: string, token: string, ttlMs: number): Promise<boolean> {
+  return (await replayMetadataRedis.set(key, token, "PX", ttlMs, "NX")) === "OK";
+}
+
+export function releaseReplayMetadataLock(key: string, token: string): Promise<number> {
+  return (replayMetadataRedis as ReplayMetadataRedis).releaseReplayMetadataLock(key, token);
 }
 
 // Dedicated connection for sticky identity re-attachment, isolated for the same

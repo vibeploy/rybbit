@@ -1,5 +1,7 @@
 import { DateTime } from "luxon";
+import { nanoid } from "nanoid";
 import { clickhouse } from "../../db/clickhouse/clickhouse.js";
+import { releaseReplayMetadataLock, tryAcquireReplayMetadataLock } from "../../db/redis/redis.js";
 import { RecordSessionReplayRequest } from "../../types/sessionReplay.js";
 import { processResults } from "../../api/analytics/utils/utils.js";
 import { parseTrackingData } from "./trackingUtils.js";
@@ -7,12 +9,51 @@ import { sessionsService } from "../sessions/sessionsService.js";
 import { userIdService } from "../userId/userIdService.js";
 import { r2Storage } from "../storage/r2StorageService.js";
 import { siteConfig } from "../../lib/siteConfig.js";
+import { LATEST_REPLAY_METADATA_QUERY, REPLAY_EVENT_AGGREGATE_QUERY } from "./sessionReplayMetadataQueries.js";
 
 export interface RequestMetadata {
   userAgent: string;
   ipAddress: string;
   origin: string;
   referrer: string;
+}
+
+interface ReplayBatchStats {
+  startTimeMs: number;
+  endTimeMs: number;
+  eventCount: number;
+  compressedSizeBytes: number;
+  screenWidth: number;
+  screenHeight: number;
+}
+
+interface StoredReplayStats {
+  start_time: string;
+  end_time: string | null;
+  event_count: number;
+  compressed_size_bytes: number;
+  screen_width: number | null;
+  screen_height: number | null;
+}
+
+const METADATA_LOCK_TTL_MS = 120_000;
+const METADATA_LOCK_RETRY_MS = 25;
+const METADATA_LOCK_ATTEMPTS = 80;
+
+function parseClickhouseDateTime(value: string | null): number | null {
+  if (!value) return null;
+  const normalized = value.includes("T") ? value : value.replace(" ", "T");
+  const withZone = /(?:Z|[+-]\d{2}:?\d{2})$/.test(normalized) ? normalized : `${normalized}Z`;
+  const timestamp = Date.parse(withZone);
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function formatClickhouseDateTime(timestamp: number): string {
+  return DateTime.fromMillis(timestamp, { zone: "utc" }).toFormat("yyyy-MM-dd HH:mm:ss");
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 /**
@@ -121,7 +162,20 @@ export class SessionReplayIngestService {
 
     // Update or insert metadata
     if (metadata) {
-      await this.updateSessionMetadata(siteId, sessionId, userId, identifiedUserId, metadata, requestMeta);
+      const timestamps = events.map(event => event.timestamp);
+      const batchStats: ReplayBatchStats | null =
+        timestamps.length > 0
+          ? {
+              startTimeMs: Math.min(...timestamps),
+              endTimeMs: Math.max(...timestamps),
+              eventCount: events.length,
+              compressedSizeBytes: eventsToInsert.reduce((total, event) => total + event.event_size_bytes, 0),
+              screenWidth: metadata.viewportWidth || 0,
+              screenHeight: metadata.viewportHeight || 0,
+            }
+          : null;
+
+      await this.updateSessionMetadata(siteId, sessionId, userId, identifiedUserId, metadata, batchStats, requestMeta);
     }
   }
 
@@ -131,22 +185,114 @@ export class SessionReplayIngestService {
     userId: string,
     identifiedUserId: string,
     metadata: any,
+    batchStats: ReplayBatchStats | null,
     requestMeta?: RequestMetadata
   ): Promise<void> {
-    // Get existing session info from events table
+    const lockKey = `replay-metadata-lock:${siteId}:${sessionId}`;
+    const lockToken = nanoid();
+    let lockAcquired = false;
+
+    try {
+      for (let attempt = 0; attempt < METADATA_LOCK_ATTEMPTS; attempt += 1) {
+        if (await tryAcquireReplayMetadataLock(lockKey, lockToken, METADATA_LOCK_TTL_MS)) {
+          lockAcquired = true;
+          break;
+        }
+        await wait(METADATA_LOCK_RETRY_MS);
+      }
+    } catch (error) {
+      console.error("Failed to acquire replay metadata lock; using event aggregate fallback:", error);
+    }
+
+    if (!lockAcquired) {
+      await this.updateSessionMetadataFromEvents(siteId, sessionId, userId, identifiedUserId, metadata, requestMeta);
+      return;
+    }
+
+    try {
+      await this.updateSessionMetadataFromSnapshot(
+        siteId,
+        sessionId,
+        userId,
+        identifiedUserId,
+        metadata,
+        batchStats,
+        requestMeta
+      );
+    } finally {
+      try {
+        await releaseReplayMetadataLock(lockKey, lockToken);
+      } catch (error) {
+        // The lock has a TTL, so a release failure must not fail an otherwise
+        // durable replay write and trigger a duplicate client retry.
+        console.error("Failed to release replay metadata lock:", error);
+      }
+    }
+  }
+
+  private async updateSessionMetadataFromSnapshot(
+    siteId: number,
+    sessionId: string,
+    userId: string,
+    identifiedUserId: string,
+    metadata: any,
+    batchStats: ReplayBatchStats | null,
+    requestMeta?: RequestMetadata
+  ): Promise<void> {
+    // The previous implementation rescanned every event in the session after
+    // every batch. Read only the latest narrow metadata snapshot and add this
+    // batch while a cross-worker Redis lock prevents lost updates.
+    const previousMetadata = await clickhouse.query({
+      query: LATEST_REPLAY_METADATA_QUERY,
+      query_params: { siteId, sessionId },
+      format: "JSONEachRow",
+    });
+
+    const previousResults = await processResults<StoredReplayStats>(previousMetadata);
+    const previous = previousResults[0];
+    if (!previous && !batchStats) return;
+
+    const previousStartMs = parseClickhouseDateTime(previous?.start_time ?? null);
+    const previousEndMs = parseClickhouseDateTime(previous?.end_time ?? null) ?? previousStartMs;
+    const startTimeMs = Math.min(
+      previousStartMs ?? Number.POSITIVE_INFINITY,
+      batchStats?.startTimeMs ?? Number.POSITIVE_INFINITY
+    );
+    const endTimeMs = Math.max(
+      previousEndMs ?? Number.NEGATIVE_INFINITY,
+      batchStats?.endTimeMs ?? Number.NEGATIVE_INFINITY
+    );
+
+    if (!Number.isFinite(startTimeMs) || !Number.isFinite(endTimeMs)) return;
+
+    await this.insertSessionMetadata(
+      siteId,
+      sessionId,
+      userId,
+      identifiedUserId,
+      metadata,
+      {
+        start_time: formatClickhouseDateTime(startTimeMs),
+        end_time: formatClickhouseDateTime(endTimeMs),
+        event_count: Number(previous?.event_count || 0) + (batchStats?.eventCount || 0),
+        compressed_size_bytes: Number(previous?.compressed_size_bytes || 0) + (batchStats?.compressedSizeBytes || 0),
+        screen_width: Math.max(Number(previous?.screen_width || 0), batchStats?.screenWidth || 0),
+        screen_height: Math.max(Number(previous?.screen_height || 0), batchStats?.screenHeight || 0),
+      },
+      requestMeta
+    );
+  }
+
+  private async updateSessionMetadataFromEvents(
+    siteId: number,
+    sessionId: string,
+    userId: string,
+    identifiedUserId: string,
+    metadata: any,
+    requestMeta?: RequestMetadata
+  ): Promise<void> {
     const sessionInfo = await clickhouse.query({
-      query: `
-        SELECT 
-          MIN(timestamp) as start_time,
-          MAX(timestamp) as end_time,
-          COUNT() as event_count,
-          SUM(event_size_bytes) as compressed_size_bytes,
-          MAX(viewport_width) as screen_width,
-          MAX(viewport_height) as screen_height
-        FROM session_replay_events
-        WHERE site_id = {siteId:UInt16} 
-          AND session_id = {sessionId:String}
-      `,
+      query: REPLAY_EVENT_AGGREGATE_QUERY,
       query_params: { siteId, sessionId },
       format: "JSONEachRow",
     });
@@ -164,8 +310,26 @@ export class SessionReplayIngestService {
 
     if (!sessionResults || sessionResults.length === 0) return;
 
-    const sessionReplayData = sessionResults[0];
+    await this.insertSessionMetadata(
+      siteId,
+      sessionId,
+      userId,
+      identifiedUserId,
+      metadata,
+      sessionResults[0],
+      requestMeta
+    );
+  }
 
+  private async insertSessionMetadata(
+    siteId: number,
+    sessionId: string,
+    userId: string,
+    identifiedUserId: string,
+    metadata: any,
+    sessionReplayData: StoredReplayStats,
+    requestMeta?: RequestMetadata
+  ): Promise<void> {
     // Parse tracking data from request metadata
     let trackingData: any = {};
     if (requestMeta?.userAgent) {
@@ -190,8 +354,9 @@ export class SessionReplayIngestService {
     }
 
     // Calculate duration
-    const startTime = new Date(sessionReplayData.start_time);
-    const endTime = sessionReplayData.end_time ? new Date(sessionReplayData.end_time) : null;
+    const startTime = new Date(parseClickhouseDateTime(sessionReplayData.start_time) ?? 0);
+    const endTimeMs = parseClickhouseDateTime(sessionReplayData.end_time);
+    const endTime = endTimeMs === null ? null : new Date(endTimeMs);
     const durationMs = endTime ? endTime.getTime() - startTime.getTime() : null;
 
     // Insert or update metadata
@@ -203,8 +368,8 @@ export class SessionReplayIngestService {
           session_id: sessionId,
           user_id: userId,
           identified_user_id: identifiedUserId,
-          start_time: DateTime.fromJSDate(startTime).toFormat("yyyy-MM-dd HH:mm:ss"),
-          end_time: endTime ? DateTime.fromJSDate(endTime).toFormat("yyyy-MM-dd HH:mm:ss") : null,
+          start_time: formatClickhouseDateTime(startTime.getTime()),
+          end_time: endTime ? formatClickhouseDateTime(endTime.getTime()) : null,
           duration_ms: durationMs,
           event_count: sessionReplayData.event_count || 0,
           compressed_size_bytes: sessionReplayData.compressed_size_bytes || 0,
