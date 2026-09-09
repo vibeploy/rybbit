@@ -19,8 +19,13 @@ class R2StorageService {
   private logger = createServiceLogger("r2-storage");
 
   constructor() {
-    // Only initialize R2 in cloud environment
-    if (IS_CLOUD && process.env.R2_ACCESS_KEY_ID && process.env.R2_SECRET_ACCESS_KEY) {
+    const explicitlyEnabled = process.env.SESSION_REPLAY_S3_ENABLED === "true";
+    const explicitlyDisabled = process.env.SESSION_REPLAY_S3_ENABLED === "false";
+    const accessKeyId = process.env.SESSION_REPLAY_S3_ACCESS_KEY_ID || process.env.R2_ACCESS_KEY_ID;
+    const secretAccessKey = process.env.SESSION_REPLAY_S3_SECRET_ACCESS_KEY || process.env.R2_SECRET_ACCESS_KEY;
+    const legacyR2Enabled = !explicitlyDisabled && IS_CLOUD && accessKeyId && secretAccessKey;
+
+    if ((explicitlyEnabled || legacyR2Enabled) && accessKeyId && secretAccessKey) {
       // Create a custom HTTP handler that strips checksum headers
       const httpHandler = new NodeHttpHandler();
       const originalHandle = httpHandler.handle.bind(httpHandler);
@@ -40,24 +45,31 @@ class R2StorageService {
         };
       };
 
+      const endpoint =
+        process.env.SESSION_REPLAY_S3_ENDPOINT ||
+        (process.env.R2_ACCOUNT_ID ? `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com` : undefined);
+      const forcePathStyle = process.env.SESSION_REPLAY_S3_FORCE_PATH_STYLE === "false" ? false : Boolean(endpoint);
+
       this.client = new S3Client({
-        region: "auto",
-        endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+        region: process.env.SESSION_REPLAY_S3_REGION || "auto",
+        ...(endpoint ? { endpoint } : {}),
         credentials: {
-          accessKeyId: process.env.R2_ACCESS_KEY_ID,
-          secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+          accessKeyId,
+          secretAccessKey,
         },
-        // Required for R2 compatibility
-        forcePathStyle: true,
+        forcePathStyle,
         // Use our custom HTTP handler
         requestHandler: httpHandler,
       });
 
-      this.bucketName = process.env.R2_BUCKET_NAME || "rybbit";
+      this.bucketName = process.env.SESSION_REPLAY_S3_BUCKET || process.env.R2_BUCKET_NAME || "rybbit";
       this.enabled = true;
-      this.logger.info({ bucket: this.bucketName }, "R2Storage initialized");
+      this.logger.info(
+        { bucket: this.bucketName, endpoint: endpoint || "AWS" },
+        "Session replay object storage initialized"
+      );
     } else {
-      this.logger.debug("R2Storage not enabled - missing IS_CLOUD or R2 credentials");
+      this.logger.debug("Session replay object storage not enabled - set SESSION_REPLAY_S3_ENABLED and credentials");
     }
   }
 
@@ -100,7 +112,7 @@ class R2StorageService {
 
       return key;
     } catch (error) {
-      console.error("[R2Storage] Failed to store batch:", error);
+      console.error("[ReplayStorage] Failed to store batch:", error);
       throw error;
     }
   }
@@ -176,7 +188,7 @@ class R2StorageService {
         throw decompressionError;
       }
     } catch (error) {
-      console.error("[R2Storage] Failed to retrieve batch:", error);
+      console.error("[ReplayStorage] Failed to retrieve batch:", error);
       throw error;
     }
   }
@@ -197,7 +209,7 @@ class R2StorageService {
         })
       );
     } catch (error) {
-      console.error("[R2Storage] Failed to delete batch:", error);
+      console.error("[ReplayStorage] Failed to delete batch:", error);
       // Non-critical error, log but don't throw
     }
   }
