@@ -1,6 +1,7 @@
 import { Redis } from "ioredis";
 import { createServiceLogger } from "../../lib/logger/logger.js";
 import { API_RATE_LIMIT_LUA } from "./apiRateLimitLua.js";
+import { getRedisConnectionOptions } from "./redisConnectionOptions.js";
 import { STICKY_RESOLVE_LUA } from "./stickyResolveLua.js";
 
 const logger = createServiceLogger("redis");
@@ -14,12 +15,14 @@ const REDIS_COMMAND_TIMEOUT_MS = 1000;
 // the heavier multi-key anomaly Lua script that runs on the same event.
 function createRedisClient(label: string): Redis {
   const client = new Redis({
-    host: process.env.REDIS_HOST || "localhost",
-    port: parseInt(process.env.REDIS_PORT || "6379", 10),
-    ...(process.env.REDIS_PASSWORD ? { password: process.env.REDIS_PASSWORD } : {}),
+    ...getRedisConnectionOptions(),
     commandTimeout: REDIS_COMMAND_TIMEOUT_MS,
     maxRetriesPerRequest: 3,
     retryStrategy: (times: number) => Math.min(times * 200, 5000),
+    // Ask Sentinel for the current primary if a long-lived connection points at
+    // a server that was demoted during failover. Returning true reconnects but
+    // does not replay an ambiguous write.
+    reconnectOnError: (error: Error) => error.message.includes("READONLY"),
   });
 
   // ioredis emits an error on every failed reconnect attempt, which floods the
