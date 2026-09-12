@@ -5,6 +5,7 @@ import { IS_CLOUD } from "./lib/const.js";
 import { createServiceLogger } from "./lib/logger/logger.js";
 import { lifecycleEmailService } from "./services/lifecycleEmails/lifecycleEmailService.js";
 import { sessionsService } from "./services/sessions/sessionsService.js";
+import { r2Storage } from "./services/storage/r2StorageService.js";
 import { telemetryService } from "./services/telemetryService.js";
 import { usageService } from "./services/usageService.js";
 import { weeklyReportService } from "./services/weekyReports/weeklyReportService.js";
@@ -35,7 +36,7 @@ if (workerCount === 0) {
 
   // Initialize databases once before forking workers
   try {
-    await Promise.all([initializeClickhouse(), initPostgres()]);
+    await Promise.all([initializeClickhouse(), initPostgres(), r2Storage.ensureRetentionLifecycle()]);
     logger.info("Database initialization complete");
   } catch (error) {
     logger.error({ err: error }, "Primary process failed during database initialization");
