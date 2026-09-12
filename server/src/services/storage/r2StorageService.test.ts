@@ -34,6 +34,8 @@ vi.mock("@aws-sdk/client-s3", () => {
     PutObjectCommand: class extends Command {},
     GetObjectCommand: class extends Command {},
     DeleteObjectCommand: class extends Command {},
+    GetBucketLifecycleConfigurationCommand: class extends Command {},
+    PutBucketLifecycleConfigurationCommand: class extends Command {},
   };
 });
 
@@ -69,6 +71,8 @@ async function loadStorage(
     region?: string;
     forcePathStyle?: string;
     genericCredentials?: boolean;
+    manageLifecycle?: string;
+    retentionHours?: string;
   } = {}
 ) {
   state.isCloud = options.cloud ?? true;
@@ -83,6 +87,12 @@ async function loadStorage(
   }
   if (options.forcePathStyle !== undefined) {
     vi.stubEnv("SESSION_REPLAY_S3_FORCE_PATH_STYLE", options.forcePathStyle);
+  }
+  if (options.manageLifecycle !== undefined) {
+    vi.stubEnv("SESSION_REPLAY_S3_MANAGE_LIFECYCLE", options.manageLifecycle);
+  }
+  if (options.retentionHours !== undefined) {
+    vi.stubEnv("SESSION_REPLAY_RETENTION_HOURS", options.retentionHours);
   }
   if (options.genericCredentials) {
     vi.stubEnv("SESSION_REPLAY_S3_ACCESS_KEY_ID", options.accessKey ?? "access-key");
@@ -320,6 +330,78 @@ describe("r2Storage.storeBatch", () => {
     releaseFirst(Buffer.from("first"));
     await expect(first).resolves.toBe("1/first/500.json.zst");
     expect(mocks.send).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("r2Storage.ensureRetentionLifecycle", () => {
+  it("does not inspect the bucket unless lifecycle management is explicitly enabled", async () => {
+    const storage = await loadStorage();
+
+    await expect(storage.ensureRetentionLifecycle()).resolves.toBeUndefined();
+    expect(mocks.send).not.toHaveBeenCalled();
+  });
+
+  it("creates a two-day lifecycle while preserving unrelated bucket rules", async () => {
+    mocks.send.mockResolvedValueOnce({
+      Rules: [{ ID: "keep-logs", Status: "Enabled", Prefix: "logs/", Expiration: { Days: 90 } }],
+    });
+    mocks.send.mockResolvedValueOnce({});
+    const storage = await loadStorage({
+      manageLifecycle: "true",
+      retentionHours: "48",
+    });
+
+    await expect(storage.ensureRetentionLifecycle()).resolves.toBeUndefined();
+    expect(mocks.send).toHaveBeenCalledTimes(2);
+    expect(sentInput(0)).toEqual({ Bucket: "test-bucket" });
+    expect(sentInput(1)).toEqual({
+      Bucket: "test-bucket",
+      LifecycleConfiguration: {
+        Rules: [
+          { ID: "keep-logs", Status: "Enabled", Prefix: "logs/", Expiration: { Days: 90 } },
+          {
+            ID: "rybbit-session-replay-retention",
+            Status: "Enabled",
+            Prefix: "",
+            Expiration: { Days: 2 },
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 },
+          },
+        ],
+      },
+    });
+  });
+
+  it("does not rewrite an equivalent lifecycle rule", async () => {
+    mocks.send.mockResolvedValue({
+      Rules: [
+        {
+          ID: "rybbit-session-replay-retention",
+          Status: "Enabled",
+          Prefix: "",
+          Expiration: { Days: 2 },
+          AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 },
+        },
+      ],
+    });
+    const storage = await loadStorage({ manageLifecycle: "true", retentionHours: "48" });
+
+    await expect(storage.ensureRetentionLifecycle()).resolves.toBeUndefined();
+    expect(mocks.send).toHaveBeenCalledOnce();
+  });
+
+  it("creates the lifecycle when the bucket has no current configuration", async () => {
+    mocks.send.mockRejectedValueOnce(Object.assign(new Error("missing"), { name: "NoSuchLifecycleConfiguration" }));
+    mocks.send.mockResolvedValueOnce({});
+    const storage = await loadStorage({ manageLifecycle: "true", retentionHours: "48" });
+
+    await expect(storage.ensureRetentionLifecycle()).resolves.toBeUndefined();
+    expect(mocks.send).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails closed when lifecycle management is enabled without object storage", async () => {
+    const storage = await loadStorage({ cloud: false, manageLifecycle: "true", retentionHours: "48" });
+
+    await expect(storage.ensureRetentionLifecycle()).rejects.toThrow("object storage is disabled");
   });
 });
 

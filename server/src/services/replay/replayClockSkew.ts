@@ -1,3 +1,5 @@
+import { SESSION_REPLAY_RETENTION_HOURS } from "../../lib/sessionReplayRetention.js";
+
 // Replay event timestamps come from the browser, not the server, so they carry
 // whatever the device's clock says. Most are fine; a handful of devices are
 // years out. Those events landed in partitions dated 2032, 2064, 2076 and 2090,
@@ -13,9 +15,9 @@
 // devices without reshaping their batches.
 export const MAX_FUTURE_SKEW_MS = 24 * 60 * 60 * 1000;
 
-// Matches the replay TTL: anything older than this is already unreadable, so
+// Matches the configured replay TTL: anything older than this is already unreadable, so
 // there is nothing to preserve by keeping its original date.
-export const MAX_PAST_SKEW_MS = 30 * 24 * 60 * 60 * 1000;
+export const MAX_PAST_SKEW_MS = SESSION_REPLAY_RETENTION_HOURS * 60 * 60 * 1000;
 
 // A browser can put a non-finite value on the wire: JSON `1e400` parses as
 // Infinity and `z.number()` admits it. Left alone it poisons the median and

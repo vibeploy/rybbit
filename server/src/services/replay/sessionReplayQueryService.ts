@@ -10,6 +10,7 @@ import { FilterParams } from "@rybbit/shared";
 import { r2Storage } from "../storage/r2StorageService.js";
 import { getFilterStatement } from "../../api/analytics/utils/getFilterStatement.js";
 import { matchesUser } from "../../api/analytics/utils/effectiveUserId.js";
+import { SESSION_REPLAY_RETENTION_HOURS } from "../../lib/sessionReplayRetention.js";
 
 /**
  * Service responsible for querying/retrieving session replay data
@@ -65,7 +66,10 @@ export class SessionReplayQueryService {
 
     const filterStatement = getFilterStatement(options.filters || "");
 
-    let whereConditions = [`site_id = {siteId:UInt16}`];
+    let whereConditions = [
+      `site_id = {siteId:UInt16}`,
+      `start_time >= now64(3) - INTERVAL ${SESSION_REPLAY_RETENTION_HOURS} HOUR`,
+    ];
     const queryParams: any = { siteId, limit, offset };
 
     if (userId) {
@@ -85,7 +89,9 @@ export class SessionReplayQueryService {
     let sessionIdsSubquery = `
       SELECT DISTINCT session_id
       FROM session_replay_events
-      WHERE site_id = {siteId:UInt16} AND event_type = '2'
+      WHERE site_id = {siteId:UInt16}
+        AND timestamp >= now64(3) - INTERVAL ${SESSION_REPLAY_RETENTION_HOURS} HOUR
+        AND event_type = '2'
     `;
 
     // If filters are present, we need to further filter by sessions that match the filter criteria
@@ -95,10 +101,13 @@ export class SessionReplayQueryService {
         FROM session_replay_metadata_v2 srm
         FINAL
         WHERE srm.site_id = {siteId:UInt16}
+          AND srm.start_time >= now64(3) - INTERVAL ${SESSION_REPLAY_RETENTION_HOURS} HOUR
           AND srm.session_id IN (
             SELECT DISTINCT session_id
             FROM session_replay_events
-            WHERE site_id = {siteId:UInt16} AND event_type = '2'
+            WHERE site_id = {siteId:UInt16}
+              AND timestamp >= now64(3) - INTERVAL ${SESSION_REPLAY_RETENTION_HOURS} HOUR
+              AND event_type = '2'
           )
           AND srm.session_id IN (
             SELECT DISTINCT session_id
@@ -162,6 +171,7 @@ export class SessionReplayQueryService {
         FINAL
         WHERE site_id = {siteId:UInt16}
           AND session_id = {sessionId:String}
+          AND start_time >= now64(3) - INTERVAL ${SESSION_REPLAY_RETENTION_HOURS} HOUR
         LIMIT 1
       `,
       query_params: { siteId, sessionId },
@@ -187,6 +197,7 @@ export class SessionReplayQueryService {
         FROM session_replay_events
         WHERE site_id = {siteId:UInt16} 
           AND session_id = {sessionId:String}
+          AND timestamp >= now64(3) - INTERVAL ${SESSION_REPLAY_RETENTION_HOURS} HOUR
         ORDER BY timestamp ASC, sequence_number ASC
       `,
       query_params: { siteId, sessionId },
@@ -292,6 +303,7 @@ export class SessionReplayQueryService {
         FINAL
         WHERE site_id = {siteId:UInt16}
           AND session_id = {sessionId:String}
+          AND start_time >= now64(3) - INTERVAL ${SESSION_REPLAY_RETENTION_HOURS} HOUR
         LIMIT 1
       `,
       query_params: { siteId, sessionId },
