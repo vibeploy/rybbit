@@ -3,7 +3,10 @@ import {
   PutObjectCommand,
   GetObjectCommand,
   DeleteObjectCommand,
+  GetBucketLifecycleConfigurationCommand,
   GetObjectCommandOutput,
+  LifecycleRule,
+  PutBucketLifecycleConfigurationCommand,
 } from "@aws-sdk/client-s3";
 import { NodeHttpHandler } from "@smithy/node-http-handler";
 import { Readable } from "stream";
@@ -11,6 +14,9 @@ import { gunzipSync } from "zlib";
 import { compress as zstdCompress, decompress as zstdDecompress } from "@mongodb-js/zstd";
 import { IS_CLOUD } from "../../lib/const.js";
 import { createServiceLogger } from "../../lib/logger/logger.js";
+import { SESSION_REPLAY_RETENTION_DAYS, SESSION_REPLAY_RETENTION_HOURS } from "../../lib/sessionReplayRetention.js";
+
+const REPLAY_RETENTION_RULE_ID = "rybbit-session-replay-retention";
 
 class R2StorageService {
   private client: S3Client | null = null;
@@ -75,6 +81,57 @@ class R2StorageService {
 
   isEnabled(): boolean {
     return this.enabled;
+  }
+
+  async ensureRetentionLifecycle(): Promise<void> {
+    if (process.env.SESSION_REPLAY_S3_MANAGE_LIFECYCLE !== "true") return;
+    if (!this.enabled || !this.client) {
+      throw new Error("Cannot manage replay lifecycle because object storage is disabled");
+    }
+
+    let existingRules: LifecycleRule[] = [];
+    try {
+      const current = await this.client.send(new GetBucketLifecycleConfigurationCommand({ Bucket: this.bucketName }));
+      existingRules = current.Rules || [];
+    } catch (error: unknown) {
+      const lifecycleError = error as { name?: string; Code?: string; code?: string };
+      const code = lifecycleError.name || lifecycleError.Code || lifecycleError.code;
+      if (code !== "NoSuchLifecycleConfiguration" && code !== "NoSuchLifecycle") throw error;
+    }
+
+    const desiredRule = {
+      ID: REPLAY_RETENTION_RULE_ID,
+      Status: "Enabled" as const,
+      Prefix: "",
+      Expiration: { Days: SESSION_REPLAY_RETENTION_DAYS },
+      AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 },
+    };
+    const currentRule = existingRules.find(rule => rule.ID === REPLAY_RETENTION_RULE_ID);
+    if (
+      currentRule?.Status === desiredRule.Status &&
+      currentRule?.Prefix === "" &&
+      currentRule?.Expiration?.Days === SESSION_REPLAY_RETENTION_DAYS &&
+      currentRule?.AbortIncompleteMultipartUpload?.DaysAfterInitiation === 1
+    ) {
+      this.logger.info(
+        { bucket: this.bucketName, retentionHours: SESSION_REPLAY_RETENTION_HOURS },
+        "Session replay object lifecycle is up to date"
+      );
+      return;
+    }
+
+    await this.client.send(
+      new PutBucketLifecycleConfigurationCommand({
+        Bucket: this.bucketName,
+        LifecycleConfiguration: {
+          Rules: [...existingRules.filter(rule => rule.ID !== REPLAY_RETENTION_RULE_ID), desiredRule],
+        },
+      })
+    );
+    this.logger.info(
+      { bucket: this.bucketName, retentionHours: SESSION_REPLAY_RETENTION_HOURS },
+      "Session replay object lifecycle configured"
+    );
   }
 
   /**

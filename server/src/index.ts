@@ -204,6 +204,7 @@ import { logger } from "./lib/logger/logger.js";
 import { registerRequestLogging } from "./lib/logger/requestLogging.js";
 import { identityBackfillQueue } from "./services/tracker/identityBackfillQueue.js";
 import { lifecycleEmailService } from "./services/lifecycleEmails/lifecycleEmailService.js";
+import { r2Storage } from "./services/storage/r2StorageService.js";
 import { telemetryService } from "./services/telemetryService.js";
 import { handleIdentify } from "./services/tracker/identifyService.js";
 import { trackEvent } from "./services/tracker/trackEvent.js";
@@ -668,7 +669,7 @@ const start = async () => {
   try {
     // When running as a cluster worker, the primary process already initialized the databases
     if (!cluster.isWorker) {
-      await Promise.all([initializeClickhouse(), initPostgres()]);
+      await Promise.all([initializeClickhouse(), initPostgres(), r2Storage.ensureRetentionLifecycle()]);
     }
 
     // Every process runs this: the ClickHouse refresh is elected through Redis,

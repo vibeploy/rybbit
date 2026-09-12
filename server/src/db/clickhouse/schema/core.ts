@@ -1,4 +1,5 @@
 import { clickhouseInitLogger as logger, execClickhouseInitStep, getTableColumns } from "../initUtils.js";
+import { SESSION_REPLAY_RETENTION_HOURS } from "../../../lib/sessionReplayRetention.js";
 
 type ColumnDefinition = {
   name: string;
@@ -283,8 +284,13 @@ export async function initializeCoreTables() {
       ENGINE = MergeTree()
       PARTITION BY toYYYYMM(timestamp)
       ORDER BY (site_id, session_id, sequence_number)
-      TTL toDateTime(timestamp) + INTERVAL 30 DAY
+      TTL toDateTime(timestamp) + INTERVAL ${SESSION_REPLAY_RETENTION_HOURS} HOUR
       `
+  );
+
+  await execClickhouseInitStep(
+    "update session replay events retention",
+    `ALTER TABLE session_replay_events MODIFY TTL toDateTime(timestamp) + INTERVAL ${SESSION_REPLAY_RETENTION_HOURS} HOUR`
   );
 
   await execClickhouseInitStep(
@@ -332,8 +338,13 @@ export async function initializeCoreTables() {
       ENGINE = ReplacingMergeTree(created_at)
       PARTITION BY toYYYYMM(start_time)
       ORDER BY (site_id, session_id)
-      TTL start_time + INTERVAL 30 DAY
+      TTL start_time + INTERVAL ${SESSION_REPLAY_RETENTION_HOURS} HOUR
       `
+  );
+
+  await execClickhouseInitStep(
+    "update legacy session replay metadata retention",
+    `ALTER TABLE session_replay_metadata MODIFY TTL start_time + INTERVAL ${SESSION_REPLAY_RETENTION_HOURS} HOUR`
   );
 
   await execClickhouseInitStep(
@@ -415,7 +426,12 @@ export async function initializeCoreTables() {
       ENGINE = AggregatingMergeTree()
       PARTITION BY toYYYYMM(start_time)
       ORDER BY (site_id, session_id)
-      TTL toDateTime(start_time) + INTERVAL 30 DAY
+      TTL toDateTime(start_time) + INTERVAL ${SESSION_REPLAY_RETENTION_HOURS} HOUR
       `
+  );
+
+  await execClickhouseInitStep(
+    "update session replay metadata retention",
+    `ALTER TABLE session_replay_metadata_v2 MODIFY TTL toDateTime(start_time) + INTERVAL ${SESSION_REPLAY_RETENTION_HOURS} HOUR`
   );
 }
