@@ -16,7 +16,6 @@ import { useEffect } from "react";
 import { AuthenticationGuard } from "../components/AuthenticationGuard";
 import { OrganizationInitializer } from "../components/OrganizationInitializer";
 import { Toaster } from "../components/ui/sonner";
-import { VersionCheck } from "../components/VersionCheck";
 import { TooltipProvider } from "../components/ui/tooltip";
 
 type EmbedTheme = "light" | "dark" | "system";
@@ -72,7 +71,6 @@ export function Providers({ children }: { children: React.ReactNode }) {
             <OrganizationInitializer />
             <AuthenticationGuard />
             {children}
-            <VersionCheck />
           </QueryProvider>
           <Toaster />
         </TooltipProvider>
