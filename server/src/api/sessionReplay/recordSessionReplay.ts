@@ -2,10 +2,16 @@ import { FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { siteConfig } from "../../lib/siteConfig.js";
 import { SessionReplayIngestService } from "../../services/replay/sessionReplayIngestService.js";
+import {
+  DroppedReplayBatchReporter,
+  ReplayObjectStorageUnavailableError,
+} from "../../services/replay/replayObjectStorageError.js";
 import { usageService } from "../../services/usageService.js";
 import { RecordSessionReplayRequest } from "../../types/sessionReplay.js";
 import { collectCandidateClientIps, resolveClientIp } from "../../services/tracker/resolveClientIp.js";
 import { decideSiteExclusion } from "../../services/sites/siteExclusionDecision.js";
+
+const droppedReplayBatches = new DroppedReplayBatchReporter(60_000);
 
 const recordSessionReplaySchema = z.object({
   userId: z.string(),
@@ -133,6 +139,16 @@ export async function recordSessionReplay(
   } catch (error) {
     if (error instanceof z.ZodError) {
       return reply.status(400).send({ error: error.errors });
+    }
+    if (error instanceof ReplayObjectStorageUnavailableError) {
+      const summary = droppedReplayBatches.record(error);
+      if (summary) {
+        request.log.warn(
+          summary,
+          "Dropped session replay batches because object storage is unavailable; nothing was written to ClickHouse"
+        );
+      }
+      return reply.status(503).send({ success: false, error: "Session replay storage unavailable" });
     }
     request.log.error(error as Error, "Error recording session replay");
     return reply.status(500).send({ error });
