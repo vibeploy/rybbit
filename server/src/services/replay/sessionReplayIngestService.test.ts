@@ -47,7 +47,7 @@ vi.mock("../../lib/siteConfig.js", () => ({
   siteConfig: {},
 }));
 
-import { SessionReplayIngestService } from "./sessionReplayIngestService.js";
+import { ReplayObjectStorageUnavailableError, SessionReplayIngestService } from "./sessionReplayIngestService.js";
 
 const requestMeta = {
   ipAddress: "198.51.100.10",
@@ -387,33 +387,59 @@ describe("SessionReplayIngestService metadata aggregation", () => {
     expect(metadataInsert?.[0].values[0].event_count).toBe(1);
   });
 
-  it("falls back to ClickHouse event bodies when S3 upload fails", async () => {
+  it("drops the batch without writing ClickHouse when S3 upload fails", async () => {
     mocks.isStorageEnabled.mockReturnValue(true);
-    mocks.storeBatch.mockRejectedValue(new Error("s3 unavailable"));
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    mocks.storeBatch.mockRejectedValue(Object.assign(new Error("quota exceeded"), { name: "QuotaExceeded" }));
 
-    try {
-      const service = new SessionReplayIngestService();
-      await service.recordEvents(
+    const service = new SessionReplayIngestService();
+    const recording = service.recordEvents(
+      42,
+      {
+        userId: "",
+        events: [{ type: 2, data: { dropped: true }, timestamp: 1_700_000_000_000 }],
+        metadata: { pageUrl: "https://example.com/" },
+      },
+      requestMeta
+    );
+
+    await expect(recording).rejects.toBeInstanceOf(ReplayObjectStorageUnavailableError);
+    await expect(recording).rejects.toMatchObject({ storageErrorName: "QuotaExceeded", eventCount: 1 });
+    expect(mocks.insert).not.toHaveBeenCalled();
+    expect(mocks.query).not.toHaveBeenCalled();
+    expect(mocks.tryAcquireReplayMetadataLock).not.toHaveBeenCalled();
+  });
+
+  it("treats a missing object key from enabled S3 storage as a failed upload", async () => {
+    mocks.isStorageEnabled.mockReturnValue(true);
+    mocks.storeBatch.mockResolvedValue(null);
+
+    const service = new SessionReplayIngestService();
+    await expect(
+      service.recordEvents(
         42,
-        {
-          userId: "",
-          events: [{ type: 2, data: { retained: true }, timestamp: 1_700_000_000_000 }],
-          metadata: { pageUrl: "https://example.com/" },
-        },
+        { userId: "", events: [{ type: 2, data: {}, timestamp: 1_700_000_000_000 }] },
         requestMeta
-      );
+      )
+    ).rejects.toBeInstanceOf(ReplayObjectStorageUnavailableError);
+    expect(mocks.insert).not.toHaveBeenCalled();
+  });
 
-      const eventInsert = mocks.insert.mock.calls.find(call => call[0].table === "session_replay_events");
-      expect(eventInsert?.[0].values[0]).toMatchObject({
-        event_data: JSON.stringify({ retained: true }),
-        event_data_key: null,
-        batch_index: null,
-      });
-      expect(errorSpy).toHaveBeenCalled();
-    } finally {
-      errorSpy.mockRestore();
-    }
+  it("keeps inline ClickHouse bodies when S3 storage is disabled", async () => {
+    mocks.isStorageEnabled.mockReturnValue(false);
+
+    const service = new SessionReplayIngestService();
+    await service.recordEvents(
+      42,
+      { userId: "", events: [{ type: 2, data: { inline: true }, timestamp: 1_700_000_000_000 }] },
+      requestMeta
+    );
+
+    expect(mocks.storeBatch).not.toHaveBeenCalled();
+    const eventInsert = mocks.insert.mock.calls.find(call => call[0].table === "session_replay_events");
+    expect(eventInsert?.[0].values[0]).toMatchObject({
+      event_data: JSON.stringify({ inline: true }),
+      event_data_key: null,
+    });
   });
 
   it("serializes concurrent metadata updates for the same session", async () => {
