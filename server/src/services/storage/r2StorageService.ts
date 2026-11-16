@@ -18,6 +18,12 @@ import { SESSION_REPLAY_RETENTION_DAYS, SESSION_REPLAY_RETENTION_HOURS } from ".
 
 const REPLAY_RETENTION_RULE_ID = "rybbit-session-replay-retention";
 
+// Bounded so a slow or unreachable object store fails a replay upload quickly
+// instead of holding ingest requests (and their bodies) in memory.
+const S3_CONNECTION_TIMEOUT_MS = 3_000;
+const S3_REQUEST_TIMEOUT_MS = 15_000;
+const S3_MAX_ATTEMPTS = 2;
+
 class R2StorageService {
   private client: S3Client | null = null;
   private bucketName: string = "";
@@ -33,7 +39,10 @@ class R2StorageService {
 
     if ((explicitlyEnabled || legacyR2Enabled) && accessKeyId && secretAccessKey) {
       // Create a custom HTTP handler that strips checksum headers
-      const httpHandler = new NodeHttpHandler();
+      const httpHandler = new NodeHttpHandler({
+        connectionTimeout: S3_CONNECTION_TIMEOUT_MS,
+        requestTimeout: S3_REQUEST_TIMEOUT_MS,
+      });
       const originalHandle = httpHandler.handle.bind(httpHandler);
 
       httpHandler.handle = async (request: any, options?: any) => {
@@ -64,6 +73,7 @@ class R2StorageService {
           secretAccessKey,
         },
         forcePathStyle,
+        maxAttempts: S3_MAX_ATTEMPTS,
         // Use our custom HTTP handler
         requestHandler: httpHandler,
       });
@@ -146,32 +156,29 @@ class R2StorageService {
     const timestamp = Date.now();
     const key = `${siteId}/${sessionId}/${timestamp}.json.zst`;
 
-    try {
-      // Compress with zstd - much faster decompression than brotli
-      const jsonBuffer = Buffer.from(JSON.stringify(eventDataArray));
-      const compressed = await zstdCompress(jsonBuffer, 3); // level 3 = good balance
+    // Failures propagate to the ingest service, which drops the batch and
+    // reports it as unavailable storage (aggregated, without the raw error).
+    // Compress with zstd - much faster decompression than brotli
+    const jsonBuffer = Buffer.from(JSON.stringify(eventDataArray));
+    const compressed = await zstdCompress(jsonBuffer, 3); // level 3 = good balance
 
-      await this.client.send(
-        new PutObjectCommand({
-          Bucket: this.bucketName,
-          Key: key,
-          Body: compressed,
-          ContentType: "application/octet-stream", // Binary data, not JSON
-          // Don't set ContentEncoding - that triggers automatic decompression
-          Metadata: {
-            siteId: siteId.toString(),
-            sessionId: sessionId,
-            eventCount: eventDataArray.length.toString(),
-            compression: "zstd",
-          },
-        })
-      );
+    await this.client.send(
+      new PutObjectCommand({
+        Bucket: this.bucketName,
+        Key: key,
+        Body: compressed,
+        ContentType: "application/octet-stream", // Binary data, not JSON
+        // Don't set ContentEncoding - that triggers automatic decompression
+        Metadata: {
+          siteId: siteId.toString(),
+          sessionId: sessionId,
+          eventCount: eventDataArray.length.toString(),
+          compression: "zstd",
+        },
+      })
+    );
 
-      return key;
-    } catch (error) {
-      console.error("[ReplayStorage] Failed to store batch:", error);
-      throw error;
-    }
+    return key;
   }
 
   /**

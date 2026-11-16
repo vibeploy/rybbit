@@ -2,6 +2,7 @@ import { FastifyReply, FastifyRequest } from "fastify";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { RecordSessionReplayRequest } from "../../types/sessionReplay.js";
 import { recordSessionReplay } from "./recordSessionReplay.js";
+import { ReplayObjectStorageUnavailableError } from "../../services/replay/replayObjectStorageError.js";
 
 const mocks = vi.hoisted(() => ({
   getConfig: vi.fn(),
@@ -11,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   recordEvents: vi.fn(),
   loggerInfo: vi.fn(),
   loggerError: vi.fn(),
+  loggerWarn: vi.fn(),
 }));
 
 vi.mock("../../lib/siteConfig.js", () => ({
@@ -89,6 +91,7 @@ function createRequest(overrides: RequestOverrides = {}): ReplayRequest {
     log: {
       error: mocks.loggerError,
       info: mocks.loggerInfo,
+      warn: mocks.loggerWarn,
     },
   } as unknown as ReplayRequest;
 }
@@ -133,6 +136,28 @@ describe("recordSessionReplay exclusions", () => {
       referrer: "https://example.com/admin/users",
     });
     expect(reply.sentPayload).toEqual({ success: true });
+  });
+
+  it("reports a dropped batch as 503 and logs once per window when object storage is unavailable", async () => {
+    mocks.recordEvents.mockRejectedValue(
+      new ReplayObjectStorageUnavailableError(42, 1, Object.assign(new Error("quota"), { name: "QuotaExceeded" }))
+    );
+
+    const first = createReply();
+    await recordSessionReplay(createRequest(), first);
+    const second = createReply();
+    await recordSessionReplay(createRequest(), second);
+
+    expect(first.statusCodeValue).toBe(503);
+    expect(first.sentPayload).toEqual({ success: false, error: "Session replay storage unavailable" });
+    expect(second.statusCodeValue).toBe(503);
+    expect(mocks.loggerWarn).toHaveBeenCalledTimes(1);
+    expect(mocks.loggerWarn.mock.calls[0][0]).toMatchObject({
+      droppedBatches: 1,
+      droppedEvents: 1,
+      lastStorageErrorName: "QuotaExceeded",
+    });
+    expect(mocks.loggerError).not.toHaveBeenCalled();
   });
 
   it("maps an IP Site Exclusion Decision to the replay skip response", async () => {

@@ -42,6 +42,8 @@ vi.mock("@aws-sdk/client-s3", () => {
 vi.mock("@smithy/node-http-handler", () => ({
   NodeHttpHandler: class {
     handle = mocks.httpHandle;
+
+    constructor(public options: Record<string, unknown> = {}) {}
   },
 }));
 
@@ -169,6 +171,11 @@ describe("r2Storage initialization", () => {
       endpoint: "https://account-123.r2.cloudflarestorage.com",
       credentials: { accessKeyId: "access-key", secretAccessKey: "secret-key" },
       forcePathStyle: true,
+      maxAttempts: 2,
+    });
+    expect(mocks.clientConfigs[0].requestHandler.options).toEqual({
+      connectionTimeout: 3_000,
+      requestTimeout: 15_000,
     });
     expect(mocks.logger.info).toHaveBeenCalledWith(
       {
@@ -297,7 +304,8 @@ describe("r2Storage.storeBatch", () => {
 
     await expect(storage.storeBatch(1, "session", [{}])).rejects.toBe(compressionError);
     expect(mocks.send).not.toHaveBeenCalled();
-    expect(console.error).toHaveBeenCalledWith("[ReplayStorage] Failed to store batch:", compressionError);
+    // Per-batch failures are reported (aggregated) by the replay route, not here.
+    expect(console.error).not.toHaveBeenCalled();
   });
 
   it("propagates object-store failures after compression", async () => {
@@ -307,7 +315,8 @@ describe("r2Storage.storeBatch", () => {
 
     await expect(storage.storeBatch(1, "session", [{}])).rejects.toBe(putError);
     expect(mocks.compress).toHaveBeenCalledOnce();
-    expect(console.error).toHaveBeenCalledWith("[ReplayStorage] Failed to store batch:", putError);
+    // Per-batch failures are reported (aggregated) by the replay route, not here.
+    expect(console.error).not.toHaveBeenCalled();
   });
 
   it("allows independent stores to progress concurrently", async () => {

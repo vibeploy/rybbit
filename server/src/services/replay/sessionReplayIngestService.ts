@@ -7,6 +7,7 @@ import { parseTrackingData } from "./trackingUtils.js";
 import { sessionsService } from "../sessions/sessionsService.js";
 import { userIdService } from "../userId/userIdService.js";
 import { r2Storage } from "../storage/r2StorageService.js";
+import { ReplayObjectStorageUnavailableError } from "./replayObjectStorageError.js";
 import { siteConfig } from "../../lib/siteConfig.js";
 
 const logger = createServiceLogger("session-replay-ingest");
@@ -20,6 +21,8 @@ type BatchStats = {
   screenWidth: number;
   screenHeight: number;
 };
+
+export { ReplayObjectStorageUnavailableError };
 
 export interface RequestMetadata {
   userAgent: string;
@@ -70,20 +73,22 @@ export class SessionReplayIngestService {
       siteId,
     });
 
-    // Check if S3-compatible object storage is enabled.
+    // When S3-compatible object storage is enabled it is the only place replay
+    // bodies may go. A failed upload drops the batch instead of inlining the
+    // bodies into ClickHouse: the inline fallback turned an object-storage
+    // outage into unbounded ClickHouse growth and backend OOMs.
     let r2BatchKey: string | null = null;
-    let eventDataArray: any[] = [];
 
     if (r2Storage.isEnabled()) {
-      // Extract event data for object storage.
-      eventDataArray = events.map(event => event.data);
-
+      const eventDataArray = events.map(event => event.data);
+      let storageError: unknown = null;
       try {
-        // Store the event data batch outside ClickHouse.
         r2BatchKey = await r2Storage.storeBatch(siteId, sessionId, eventDataArray);
       } catch (error) {
-        console.error("Failed to store replay batch in object storage, falling back to ClickHouse:", error);
-        r2BatchKey = null;
+        storageError = error;
+      }
+      if (!r2BatchKey) {
+        throw new ReplayObjectStorageUnavailableError(siteId, events.length, storageError);
       }
     }
 
