@@ -115,3 +115,30 @@ describe("session hourly materialized view initialization", () => {
     expect(executedQueries()).not.toContainEqual(expect.stringMatching(/DROP VIEW/));
   });
 });
+
+describe("session replay retention initialization", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.exec.mockResolvedValue(undefined);
+    mocks.query.mockImplementation(async ({ query }: { query: string }) => {
+      if (query.includes("FROM system.columns") || query.includes("FROM system.tables")) {
+        return { json: async () => [] };
+      }
+      throw new Error(`Unexpected ClickHouse query: ${query}`);
+    });
+  });
+
+  it("modifies every replay TTL without materializing it", async () => {
+    await initializeClickhouse();
+
+    const ttlCalls = mocks.exec.mock.calls.map(([args]) => args).filter(args => /MODIFY\s+TTL/i.test(args.query));
+    expect(ttlCalls.map(args => args.query.match(/ALTER TABLE (\w+)/)?.[1]).sort()).toEqual([
+      "session_replay_events",
+      "session_replay_metadata",
+      "session_replay_metadata_v2",
+    ]);
+    for (const args of ttlCalls) {
+      expect(args.clickhouse_settings).toMatchObject({ materialize_ttl_after_modify: 0 });
+    }
+  });
+});
