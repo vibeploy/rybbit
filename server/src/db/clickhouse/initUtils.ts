@@ -3,17 +3,29 @@ import { CLICKHOUSE_REQUEST_TIMEOUT_MS, clickhouse } from "./client.js";
 
 export const clickhouseInitLogger = createServiceLogger("clickhouse");
 
-export async function execClickhouseInitStep(
+type ClickhouseInitStepOptions = { optional?: boolean; lockAcquireTimeoutSeconds?: number };
+
+// ClickHouse defaults to materialize_ttl_after_modify=1, which turns MODIFY TTL into a
+// mutation that rewrites every existing part. On a large replay table that mutation
+// exhausted server memory (2026-11-16). TTL changes must go through
+// modifyClickhouseTableTtl so expired rows are removed by background TTL merges instead.
+const MODIFY_TTL_PATTERN = /\bMODIFY\s+TTL\b/i;
+const TABLE_IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+async function runClickhouseInitStep(
   step: string,
   query: string,
-  options?: { optional?: boolean; lockAcquireTimeoutSeconds?: number }
+  options: ClickhouseInitStepOptions | undefined,
+  settings: { materialize_ttl_after_modify?: 0 }
 ) {
+  const clickhouseSettings = {
+    ...settings,
+    ...(options?.lockAcquireTimeoutSeconds ? { lock_acquire_timeout: options.lockAcquireTimeoutSeconds } : {}),
+  };
   try {
     await clickhouse.exec({
       query,
-      clickhouse_settings: options?.lockAcquireTimeoutSeconds
-        ? { lock_acquire_timeout: options.lockAcquireTimeoutSeconds }
-        : undefined,
+      clickhouse_settings: Object.keys(clickhouseSettings).length > 0 ? clickhouseSettings : undefined,
     });
   } catch (error) {
     clickhouseInitLogger.error(
@@ -24,6 +36,27 @@ export async function execClickhouseInitStep(
       throw error;
     }
   }
+}
+
+export async function execClickhouseInitStep(step: string, query: string, options?: ClickhouseInitStepOptions) {
+  if (MODIFY_TTL_PATTERN.test(query)) {
+    throw new Error(`ClickHouse init step "${step}" must use modifyClickhouseTableTtl for MODIFY TTL`);
+  }
+  await runClickhouseInitStep(step, query, options, {});
+}
+
+export async function modifyClickhouseTableTtl(
+  step: string,
+  table: string,
+  ttlExpression: string,
+  options?: ClickhouseInitStepOptions
+) {
+  if (!TABLE_IDENTIFIER_PATTERN.test(table)) {
+    throw new Error(`ClickHouse init step "${step}" has an invalid table identifier`);
+  }
+  await runClickhouseInitStep(step, `ALTER TABLE ${table} MODIFY TTL ${ttlExpression}`, options, {
+    materialize_ttl_after_modify: 0,
+  });
 }
 
 export async function getTableColumns(table: string) {
