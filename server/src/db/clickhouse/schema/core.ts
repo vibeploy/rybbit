@@ -1,4 +1,4 @@
-import { clickhouseInitLogger as logger, execClickhouseInitStep, getTableColumns } from "../initUtils.js";
+import { clickhouseInitLogger as logger, execClickhouseInitStep, getTableColumns, modifyClickhouseTableTtl } from "../initUtils.js";
 import { SESSION_REPLAY_RETENTION_HOURS } from "../../../lib/sessionReplayRetention.js";
 
 type ColumnDefinition = {
@@ -288,9 +288,10 @@ export async function initializeCoreTables() {
       `
   );
 
-  await execClickhouseInitStep(
+  await modifyClickhouseTableTtl(
     "update session replay events retention",
-    `ALTER TABLE session_replay_events MODIFY TTL toDateTime(timestamp) + INTERVAL ${SESSION_REPLAY_RETENTION_HOURS} HOUR`
+    "session_replay_events",
+    `toDateTime(timestamp) + INTERVAL ${SESSION_REPLAY_RETENTION_HOURS} HOUR`
   );
 
   await execClickhouseInitStep(
@@ -342,9 +343,10 @@ export async function initializeCoreTables() {
       `
   );
 
-  await execClickhouseInitStep(
+  await modifyClickhouseTableTtl(
     "update legacy session replay metadata retention",
-    `ALTER TABLE session_replay_metadata MODIFY TTL start_time + INTERVAL ${SESSION_REPLAY_RETENTION_HOURS} HOUR`
+    "session_replay_metadata",
+    `start_time + INTERVAL ${SESSION_REPLAY_RETENTION_HOURS} HOUR`
   );
 
   await execClickhouseInitStep(
@@ -430,8 +432,9 @@ export async function initializeCoreTables() {
       `
   );
 
-  await execClickhouseInitStep(
+  await modifyClickhouseTableTtl(
     "update session replay metadata retention",
-    `ALTER TABLE session_replay_metadata_v2 MODIFY TTL toDateTime(start_time) + INTERVAL ${SESSION_REPLAY_RETENTION_HOURS} HOUR`
+    "session_replay_metadata_v2",
+    `toDateTime(start_time) + INTERVAL ${SESSION_REPLAY_RETENTION_HOURS} HOUR`
   );
 }
