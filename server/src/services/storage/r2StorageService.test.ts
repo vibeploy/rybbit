@@ -267,9 +267,10 @@ describe("r2Storage.storeBatch", () => {
       { type: "custom_event", name: "signup" },
     ];
 
-    await expect(storage.storeBatch(42, "session/with spaces", events)).resolves.toBe(
-      "42/session/with spaces/1725000123456.json.zst"
-    );
+    await expect(storage.storeBatch(42, "session/with spaces", events)).resolves.toEqual({
+      key: "42/session/with spaces/1725000123456.json.zst",
+      sizeBytes: Buffer.from(`zstd:${JSON.stringify(events)}`).length,
+    });
 
     expect(mocks.compress).toHaveBeenCalledOnce();
     expect(mocks.compress.mock.calls[0][0].toString()).toBe(JSON.stringify(events));
@@ -293,7 +294,7 @@ describe("r2Storage.storeBatch", () => {
     mocks.send.mockResolvedValue({});
     const storage = await loadStorage();
 
-    await expect(storage.storeBatch(0, "empty", [])).resolves.toBe("0/empty/100.json.zst");
+    await expect(storage.storeBatch(0, "empty", [])).resolves.toMatchObject({ key: "0/empty/100.json.zst" });
     expect(sentInput().Metadata.eventCount).toBe("0");
   });
 
@@ -332,12 +333,12 @@ describe("r2Storage.storeBatch", () => {
     const first = storage.storeBatch(1, "first", [{ sequence: 1 }]);
     const second = storage.storeBatch(2, "second", [{ sequence: 2 }]);
 
-    await expect(second).resolves.toBe("2/second/500.json.zst");
+    await expect(second).resolves.toMatchObject({ key: "2/second/500.json.zst" });
     expect(mocks.send).toHaveBeenCalledOnce();
     expect(sentInput().Key).toBe("2/second/500.json.zst");
 
     releaseFirst(Buffer.from("first"));
-    await expect(first).resolves.toBe("1/first/500.json.zst");
+    await expect(first).resolves.toMatchObject({ key: "1/first/500.json.zst" });
     expect(mocks.send).toHaveBeenCalledTimes(2);
   });
 });

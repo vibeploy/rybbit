@@ -149,6 +149,32 @@ describe("SessionReplayIngestService object storage failures", () => {
     expect(mocks.insert).not.toHaveBeenCalled();
   });
 
+  it("accounts each stored object with its real size before the events that reference it", async () => {
+    mocks.isStorageEnabled.mockReturnValue(true);
+    mocks.storeBatch.mockResolvedValue({ key: "42/session-1/1.json.zst", sizeBytes: 321 });
+
+    const service = new SessionReplayIngestService();
+    await service.recordEvents(
+      42,
+      { userId: "", events: [{ type: 2, data: { stored: true }, timestamp: 1_700_000_000_000 }] },
+      requestMeta
+    );
+
+    const tables = mocks.insert.mock.calls.map(call => call[0].table);
+    expect(tables.indexOf("session_replay_objects")).toBeLessThan(tables.indexOf("session_replay_events"));
+    const objectInsert = mocks.insert.mock.calls.find(call => call[0].table === "session_replay_objects");
+    expect(objectInsert?.[0].values).toEqual([
+      expect.objectContaining({
+        site_id: 42,
+        session_id: "session-1",
+        object_key: "42/session-1/1.json.zst",
+        size_bytes: 321,
+      }),
+    ]);
+    const eventInsert = mocks.insert.mock.calls.find(call => call[0].table === "session_replay_events");
+    expect(eventInsert?.[0].values[0]).toMatchObject({ event_data: "", event_data_key: "42/session-1/1.json.zst" });
+  });
+
   it("keeps inline ClickHouse bodies when S3 storage is disabled", async () => {
     const service = new SessionReplayIngestService();
     await service.recordEvents(

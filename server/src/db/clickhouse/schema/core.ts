@@ -1,6 +1,10 @@
 import { clickhouseInitLogger as logger, execClickhouseInitStep, getTableColumns, modifyClickhouseTableTtl } from "../initUtils.js";
 import { SESSION_REPLAY_RETENTION_HOURS } from "../../../lib/sessionReplayRetention.js";
 
+// Bucket lifecycle expiry runs about once a day, so an object can outlive the
+// ClickHouse TTL of the rows that describe it by up to this long.
+const SESSION_REPLAY_OBJECT_LIFECYCLE_LAG_HOURS = 48;
+
 type ColumnDefinition = {
   name: string;
   definition: string;
@@ -436,5 +440,33 @@ export async function initializeCoreTables() {
     "update session replay metadata retention",
     "session_replay_metadata_v2",
     `toDateTime(start_time) + INTERVAL ${SESSION_REPLAY_RETENTION_HOURS} HOUR`
+  );
+
+  // One row per replay batch object written to object storage, with its real
+  // stored (compressed) size. The per-site quota job sums this instead of
+  // listing the bucket, which at production volume takes minutes. Rows outlive
+  // the replay retention by two days because bucket lifecycle expiry runs once
+  // a day and can lag the ClickHouse TTL by up to that long.
+  await execClickhouseInitStep(
+    "create session replay objects table",
+    `
+      CREATE TABLE IF NOT EXISTS session_replay_objects (
+        site_id UInt16,
+        session_id String,
+        object_key String,
+        size_bytes UInt64,
+        created_at DateTime64(3)
+      )
+      ENGINE = MergeTree
+      PARTITION BY toYYYYMMDD(created_at)
+      ORDER BY (site_id, session_id, created_at)
+      TTL toDateTime(created_at) + INTERVAL ${SESSION_REPLAY_RETENTION_HOURS + SESSION_REPLAY_OBJECT_LIFECYCLE_LAG_HOURS} HOUR
+      `
+  );
+
+  await modifyClickhouseTableTtl(
+    "update session replay objects retention",
+    "session_replay_objects",
+    `toDateTime(created_at) + INTERVAL ${SESSION_REPLAY_RETENTION_HOURS + SESSION_REPLAY_OBJECT_LIFECYCLE_LAG_HOURS} HOUR`
   );
 }

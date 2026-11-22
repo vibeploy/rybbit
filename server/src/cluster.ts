@@ -6,6 +6,7 @@ import { createServiceLogger } from "./lib/logger/logger.js";
 import { lifecycleEmailService } from "./services/lifecycleEmails/lifecycleEmailService.js";
 import { sessionsService } from "./services/sessions/sessionsService.js";
 import { r2Storage } from "./services/storage/r2StorageService.js";
+import { sessionReplaySiteQuotaService } from "./services/replay/sessionReplaySiteQuotaService.js";
 import { telemetryService } from "./services/telemetryService.js";
 import { usageService } from "./services/usageService.js";
 import { weeklyReportService } from "./services/weekyReports/weeklyReportService.js";
@@ -46,6 +47,7 @@ if (workerCount === 0) {
   // Start cron jobs on the primary process only
   telemetryService.startTelemetryCron();
   usageService.startUsageCheckCron();
+  sessionReplaySiteQuotaService.start();
   if (IS_CLOUD && process.env.NODE_ENV !== "development") {
     weeklyReportService.startWeeklyReportCron();
     lifecycleEmailService.startLifecycleCron();
@@ -116,6 +118,7 @@ if (workerCount === 0) {
 
     // Stop cron jobs
     usageService.stopUsageCheckCron();
+    sessionReplaySiteQuotaService.stop();
     void sessionsService.close();
     telemetryService.stopTelemetryCron();
     if (IS_CLOUD) {
