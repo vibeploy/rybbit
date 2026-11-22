@@ -205,6 +205,7 @@ import { registerRequestLogging } from "./lib/logger/requestLogging.js";
 import { identityBackfillQueue } from "./services/tracker/identityBackfillQueue.js";
 import { lifecycleEmailService } from "./services/lifecycleEmails/lifecycleEmailService.js";
 import { r2Storage } from "./services/storage/r2StorageService.js";
+import { sessionReplaySiteQuotaService } from "./services/replay/sessionReplaySiteQuotaService.js";
 import { telemetryService } from "./services/telemetryService.js";
 import { handleIdentify } from "./services/tracker/identifyService.js";
 import { trackEvent } from "./services/tracker/trackEvent.js";
@@ -680,6 +681,7 @@ const start = async () => {
     if (!cluster.isWorker) {
       telemetryService.startTelemetryCron();
       usageService.startUsageCheckCron();
+      sessionReplaySiteQuotaService.start();
       if (IS_CLOUD && process.env.NODE_ENV !== "development") {
         weeklyReportService.startWeeklyReportCron();
         lifecycleEmailService.startLifecycleCron();

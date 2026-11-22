@@ -3,6 +3,7 @@ import {
   PutObjectCommand,
   GetObjectCommand,
   DeleteObjectCommand,
+  DeleteObjectsCommand,
   GetBucketLifecycleConfigurationCommand,
   GetObjectCommandOutput,
   LifecycleRule,
@@ -23,6 +24,13 @@ const REPLAY_RETENTION_RULE_ID = "rybbit-session-replay-retention";
 const S3_CONNECTION_TIMEOUT_MS = 3_000;
 const S3_REQUEST_TIMEOUT_MS = 15_000;
 const S3_MAX_ATTEMPTS = 2;
+
+const DELETE_OBJECTS_CHUNK = 1000;
+
+export interface StoredReplayBatch {
+  key: string;
+  sizeBytes: number;
+}
 
 class R2StorageService {
   private client: S3Client | null = null;
@@ -146,9 +154,9 @@ class R2StorageService {
 
   /**
    * Store a batch of event data in R2
-   * Returns the storage key if successful, null if R2 is disabled
+   * Returns the storage key and stored (compressed) size, or null if R2 is disabled
    */
-  async storeBatch(siteId: number, sessionId: string, eventDataArray: any[]): Promise<string | null> {
+  async storeBatch(siteId: number, sessionId: string, eventDataArray: any[]): Promise<StoredReplayBatch | null> {
     if (!this.enabled || !this.client) {
       return null;
     }
@@ -178,7 +186,43 @@ class R2StorageService {
       })
     );
 
-    return key;
+    return { key, sizeBytes: compressed.length };
+  }
+
+  /**
+   * Delete many objects, at most 1000 per request. Never throws: the result
+   * names every key that was not confirmed deleted so the caller can keep the
+   * rows that reference them and retry later.
+   */
+  async deleteObjects(keys: string[]): Promise<{ deleted: number; failedKeys: string[] }> {
+    if (!this.enabled || !this.client) {
+      return { deleted: 0, failedKeys: [...keys] };
+    }
+    let deleted = 0;
+    const failedKeys: string[] = [];
+    for (let offset = 0; offset < keys.length; offset += DELETE_OBJECTS_CHUNK) {
+      const chunk = keys.slice(offset, offset + DELETE_OBJECTS_CHUNK);
+      try {
+        const result = await this.client.send(
+          new DeleteObjectsCommand({
+            Bucket: this.bucketName,
+            Delete: { Objects: chunk.map(Key => ({ Key })), Quiet: true },
+          })
+        );
+        const errored = new Set((result.Errors || []).map(error => error.Key).filter((key): key is string => !!key));
+        for (const key of chunk) {
+          if (errored.has(key)) failedKeys.push(key);
+          else deleted += 1;
+        }
+      } catch (error) {
+        this.logger.warn(
+          { err: error, bucket: this.bucketName, keys: chunk.length },
+          "Session replay object batch delete failed"
+        );
+        failedKeys.push(...chunk);
+      }
+    }
+    return { deleted, failedKeys };
   }
 
   /**

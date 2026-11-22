@@ -6,7 +6,7 @@ import { correctReplayClockSkew } from "./replayClockSkew.js";
 import { parseTrackingData } from "./trackingUtils.js";
 import { sessionsService } from "../sessions/sessionsService.js";
 import { userIdService } from "../userId/userIdService.js";
-import { r2Storage } from "../storage/r2StorageService.js";
+import { r2Storage, type StoredReplayBatch } from "../storage/r2StorageService.js";
 import { ReplayObjectStorageUnavailableError } from "./replayObjectStorageError.js";
 import { siteConfig } from "../../lib/siteConfig.js";
 
@@ -82,14 +82,31 @@ export class SessionReplayIngestService {
     if (r2Storage.isEnabled()) {
       const eventDataArray = events.map(event => event.data);
       let storageError: unknown = null;
+      let stored: StoredReplayBatch | null = null;
       try {
-        r2BatchKey = await r2Storage.storeBatch(siteId, sessionId, eventDataArray);
+        stored = await r2Storage.storeBatch(siteId, sessionId, eventDataArray);
       } catch (error) {
         storageError = error;
       }
-      if (!r2BatchKey) {
+      if (!stored) {
         throw new ReplayObjectStorageUnavailableError(siteId, events.length, storageError);
       }
+      r2BatchKey = stored.key;
+      // The per-site quota job accounts storage from these rows. Recorded
+      // before the events so an object that is referenced is always counted.
+      await clickhouse.insert({
+        table: "session_replay_objects",
+        values: [
+          {
+            site_id: siteId,
+            session_id: sessionId,
+            object_key: stored.key,
+            size_bytes: stored.sizeBytes,
+            created_at: DateTime.utc().toFormat("yyyy-MM-dd HH:mm:ss.SSS"),
+          },
+        ],
+        format: "JSONEachRow",
+      });
     }
 
     // Prepare events for batch insert
