@@ -166,3 +166,40 @@ describe("runSiteQuotaOnce", () => {
     expect(results.map(result => result.siteId)).toEqual([2]);
   });
 });
+
+describe("quota run stops when the lease is lost", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.command.mockResolvedValue(undefined);
+  });
+
+  it("starts no further session group once the check turns false", async () => {
+    const sessions = Array.from({ length: 1200 }, (_, index) => ({
+      session_id: `s${String(index).padStart(4, "0")}`,
+      bytes: 10 * GiB,
+      last_at: `2026-11-22 01:00:00.${String(index).padStart(3, "0")}`,
+    }));
+    routeQueries({ sessions, keys: [] });
+    mocks.deleteObjects.mockResolvedValue({ deleted: 0, failedKeys: [] });
+    let checks = 0;
+
+    await enforceSiteQuota(7, 12_000 * GiB, GiB, () => ++checks <= 1);
+
+    // Three groups of 500 are planned; only the first runs.
+    expect(mocks.deleteObjects).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips the remaining sites", async () => {
+    routeQueries({
+      sites: [{ site_id: 1, used_bytes: 2 * GiB }, { site_id: 2, used_bytes: 2 * GiB }],
+      sessions: [{ session_id: "x", bytes: 2 * GiB, last_at: "2026-11-22 01:00:00.000" }],
+      keys: [],
+    });
+    mocks.deleteObjects.mockResolvedValue({ deleted: 0, failedKeys: [] });
+
+    const results = await runSiteQuotaOnce(GiB, () => false);
+
+    expect(results).toEqual([]);
+    expect(mocks.deleteObjects).not.toHaveBeenCalled();
+  });
+});
