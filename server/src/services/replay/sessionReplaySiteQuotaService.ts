@@ -1,6 +1,7 @@
 import * as cron from "node-cron";
 import { clickhouse } from "../../db/clickhouse/clickhouse.js";
 import { redis } from "../../db/redis/redis.js";
+import { acquireRedisLease } from "../../lib/redisLease.js";
 import { processResults } from "../../api/analytics/utils/utils.js";
 import { createServiceLogger } from "../../lib/logger/logger.js";
 import {
@@ -17,6 +18,15 @@ const LOCK_KEY = "replay:site-quota:lock";
 const MAX_SESSIONS_PER_SITE_PER_RUN = 2000;
 const SESSION_ID_CHUNK = 500;
 const QUERY_SETTINGS = { max_execution_time: 60 } as const;
+// A run can outlast the interval, so the lock is a short lease the holder
+// keeps renewing instead of a fixed TTL that expires mid-run and lets another
+// replica start evicting the same sessions.
+const LEASE_TTL_MS = 60_000;
+const LEASE_RENEW_MS = 20_000;
+
+/** Checked before each unit of work; false means stop without starting more. */
+export type ContinueCheck = () => boolean;
+const always: ContinueCheck = () => true;
 
 export interface ReplaySessionUsage {
   sessionId: string;
@@ -141,7 +151,8 @@ async function deleteSessionRows(siteId: number, sessionIds: string[]): Promise<
 export async function enforceSiteQuota(
   siteId: number,
   usedBytes: number,
-  quotaBytes: number
+  quotaBytes: number,
+  shouldContinue: ContinueCheck = always
 ): Promise<SiteQuotaRunResult> {
   const evictions = planSiteEviction(await siteSessions(siteId), quotaBytes).slice(0, MAX_SESSIONS_PER_SITE_PER_RUN);
   const result: SiteQuotaRunResult = {
@@ -154,6 +165,7 @@ export async function enforceSiteQuota(
   };
 
   for (const group of chunk(evictions, SESSION_ID_CHUNK)) {
+    if (!shouldContinue()) break;
     const sessionIds = group.map(session => session.sessionId);
     const keysBySession = await sessionObjectKeys(siteId, sessionIds);
     const allKeys = [...keysBySession.values()].flatMap(keys => [...keys]);
@@ -177,11 +189,18 @@ export async function enforceSiteQuota(
   return result;
 }
 
-export async function runSiteQuotaOnce(quotaBytes: number): Promise<SiteQuotaRunResult[]> {
+export async function runSiteQuotaOnce(
+  quotaBytes: number,
+  shouldContinue: ContinueCheck = always
+): Promise<SiteQuotaRunResult[]> {
   const results: SiteQuotaRunResult[] = [];
   for (const site of await sitesOverQuota(quotaBytes)) {
+    if (!shouldContinue()) {
+      logger.warn({ siteId: site.siteId }, "Session replay site quota lease lost; stopping run");
+      break;
+    }
     try {
-      const result = await enforceSiteQuota(site.siteId, site.usedBytes, quotaBytes);
+      const result = await enforceSiteQuota(site.siteId, site.usedBytes, quotaBytes, shouldContinue);
       results.push(result);
       logger.info({ ...result, quotaBytes }, "Session replay site quota enforced");
       if (result.failedSessions > 0) {
@@ -206,8 +225,8 @@ class SessionReplaySiteQuotaService {
       return;
     }
     const minutes = SESSION_REPLAY_SITE_QUOTA_INTERVAL_MINUTES;
-    this.task = cron.schedule(`*/${minutes} * * * *`, () => void this.tick(quotaBytes, minutes), { timezone: "UTC" });
-    void this.tick(quotaBytes, minutes);
+    this.task = cron.schedule(`*/${minutes} * * * *`, () => void this.tick(quotaBytes), { timezone: "UTC" });
+    void this.tick(quotaBytes);
     logger.info({ quotaBytes, intervalMinutes: minutes }, "Session replay site quota job started");
   }
 
@@ -216,21 +235,31 @@ class SessionReplaySiteQuotaService {
     this.task = null;
   }
 
-  private async tick(quotaBytes: number, minutes: number): Promise<void> {
+  /** Visible for tests. */
+  async tick(quotaBytes: number): Promise<void> {
     if (this.running) return;
     this.running = true;
     try {
-      // One replica runs per interval. Without Redis we skip rather than let
+      // One replica runs at a time. Without Redis we skip rather than let
       // every replica evict at once; the next tick tries again.
-      let won: string | null = null;
+      let lease;
       try {
-        won = await redis.set(LOCK_KEY, String(process.pid), "PX", minutes * 60_000 - 5_000, "NX");
+        lease = await acquireRedisLease(redis, LOCK_KEY, {
+          ttlMs: LEASE_TTL_MS,
+          renewEveryMs: LEASE_RENEW_MS,
+          onLost: (reason, error) =>
+            logger.warn({ err: error, reason }, "Session replay site quota lease lost; run will stop"),
+        });
       } catch (error) {
         logger.warn({ err: error }, "Session replay site quota lock unavailable; skipping run");
         return;
       }
-      if (won !== "OK") return;
-      await runSiteQuotaOnce(quotaBytes);
+      if (!lease) return;
+      try {
+        await runSiteQuotaOnce(quotaBytes, lease.held);
+      } finally {
+        await lease.release();
+      }
     } catch (error) {
       logger.error({ err: error }, "Session replay site quota run failed");
     } finally {
