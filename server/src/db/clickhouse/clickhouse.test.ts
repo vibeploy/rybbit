@@ -136,6 +136,7 @@ describe("session replay retention initialization", () => {
       "session_replay_events",
       "session_replay_metadata",
       "session_replay_metadata_v2",
+      "session_replay_objects",
     ]);
     for (const args of ttlCalls) {
       expect(args.clickhouse_settings).toMatchObject({ materialize_ttl_after_modify: 0 });
