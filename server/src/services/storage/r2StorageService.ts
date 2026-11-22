@@ -209,17 +209,32 @@ class R2StorageService {
             Delete: { Objects: chunk.map(Key => ({ Key })), Quiet: true },
           })
         );
-        const errored = new Set((result.Errors || []).map(error => error.Key).filter((key): key is string => !!key));
+        const errors = result.Errors || [];
+        const errored = new Set(errors.map(error => error.Key).filter((key): key is string => !!key));
         for (const key of chunk) {
           if (errored.has(key)) failedKeys.push(key);
           else deleted += 1;
         }
+        if (errors.length > 0) {
+          this.logger.warn(
+            { bucket: this.bucketName, failed: errors.length, firstCode: errors[0]?.Code ?? null },
+            "Session replay objects not deleted"
+          );
+        }
       } catch (error) {
+        // A request-level failure (wrong endpoint, auth, outage) will fail every
+        // remaining chunk the same way; stop instead of issuing hundreds of doomed calls.
         this.logger.warn(
-          { err: error, bucket: this.bucketName, keys: chunk.length },
-          "Session replay object batch delete failed"
+          {
+            err: error,
+            bucket: this.bucketName,
+            httpStatus: (error as { $metadata?: { httpStatusCode?: number } })?.$metadata?.httpStatusCode ?? null,
+            skippedKeys: keys.length - offset,
+          },
+          "Session replay object batch delete failed; aborting remaining chunks"
         );
-        failedKeys.push(...chunk);
+        failedKeys.push(...keys.slice(offset));
+        break;
       }
     }
     return { deleted, failedKeys };

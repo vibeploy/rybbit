@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   logger: {
     debug: vi.fn(),
     info: vi.fn(),
+    warn: vi.fn(),
   },
 }));
 
@@ -34,6 +35,7 @@ vi.mock("@aws-sdk/client-s3", () => {
     PutObjectCommand: class extends Command {},
     GetObjectCommand: class extends Command {},
     DeleteObjectCommand: class extends Command {},
+    DeleteObjectsCommand: class extends Command {},
     GetBucketLifecycleConfigurationCommand: class extends Command {},
     PutBucketLifecycleConfigurationCommand: class extends Command {},
   };
@@ -508,5 +510,51 @@ describe("r2Storage.deleteBatch", () => {
 
     await expect(storage.deleteBatch("1/session/batch.json.zst")).resolves.toBeUndefined();
     expect(console.error).toHaveBeenCalledWith("[ReplayStorage] Failed to delete batch:", deleteError);
+  });
+});
+
+describe("r2Storage.deleteObjects", () => {
+  const keys = (n: number) => Array.from({ length: n }, (_, i) => `1/s/${i}.json.zst`);
+
+  it("deletes in chunks of 1000 and reports per-key errors as failed", async () => {
+    mocks.send
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({ Errors: [{ Key: "1/s/1000.json.zst", Code: "AccessDenied" }] });
+    const storage = await loadStorage();
+
+    const result = await storage.deleteObjects(keys(1500));
+
+    expect(mocks.send).toHaveBeenCalledTimes(2);
+    expect(mocks.send.mock.calls[0][0].input.Delete.Objects).toHaveLength(1000);
+    expect(mocks.send.mock.calls[1][0].input.Delete.Objects).toHaveLength(500);
+    expect(result).toEqual({ deleted: 1499, failedKeys: ["1/s/1000.json.zst"] });
+    expect(mocks.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ failed: 1, firstCode: "AccessDenied" }),
+      "Session replay objects not deleted"
+    );
+  });
+
+  it("aborts remaining chunks after a request-level failure and marks them all failed", async () => {
+    const error = Object.assign(new Error("not found"), { $metadata: { httpStatusCode: 404 } });
+    mocks.send.mockResolvedValueOnce({}).mockRejectedValueOnce(error);
+    const storage = await loadStorage();
+
+    const result = await storage.deleteObjects(keys(3500));
+
+    expect(mocks.send).toHaveBeenCalledTimes(2);
+    expect(result.deleted).toBe(1000);
+    expect(result.failedKeys).toHaveLength(2500);
+    expect(result.failedKeys[0]).toBe("1/s/1000.json.zst");
+    expect(mocks.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ httpStatus: 404, skippedKeys: 2500 }),
+      "Session replay object batch delete failed; aborting remaining chunks"
+    );
+  });
+
+  it("fails every key without I/O when storage is disabled", async () => {
+    const storage = await loadStorage({ cloud: false });
+
+    await expect(storage.deleteObjects(keys(2))).resolves.toEqual({ deleted: 0, failedKeys: keys(2) });
+    expect(mocks.send).not.toHaveBeenCalled();
   });
 });
