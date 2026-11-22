@@ -1,0 +1,192 @@
+name: Vibeploy upstream sync
+
+# Replays the vibeploy patch set onto each new upstream release and opens a PR.
+# It never builds images or deploys; publishing stays a manual Docker Publish run.
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+    inputs:
+      target_tag:
+        description: "Upstream release tag (vX.Y.Z); empty means the newest"
+        required: false
+        default: ""
+      dry_run:
+        description: "Replay and test only; push no branch and open no PR"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vibeploy-upstream-sync
+  cancel-in-progress: false
+
+env:
+  TZ: UTC
+
+jobs:
+  prepare:
+    name: Replay patches
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      status: ${{ steps.sync.outputs.status }}
+      target_tag: ${{ steps.sync.outputs.target_tag }}
+      new_branch: ${{ steps.sync.outputs.new_branch }}
+      sync_branch: ${{ steps.sync.outputs.sync_branch }}
+    steps:
+      # Pushing upstream history changes .github/workflows, which GITHUB_TOKEN
+      # may not do, so pushes and the PR need a token with workflow scope.
+      - name: Require sync token
+        if: inputs.dry_run != true
+        env:
+          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::Set the UPSTREAM_SYNC_TOKEN secret (fine-grained PAT on this repo: Contents, Workflows and Pull requests read/write), or run with dry_run."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Replay vibeploy patches
+        id: sync
+        env:
+          TARGET_TAG: ${{ inputs.target_tag }}
+          REPORT_FILE: ${{ runner.temp }}/report/pr-body.md
+        run: |
+          mkdir -p "$RUNNER_TEMP/report"
+          # The checkout moves off master below; run the script from a copy.
+          cp .github/scripts/vibeploy-upstream-sync.sh "$RUNNER_TEMP/sync.sh"
+          git remote add upstream https://github.com/rybbit-io/rybbit.git
+          git config user.name "vibeploy-sync[bot]"
+          git config user.email "vibeploy-sync@users.noreply.github.com"
+          bash "$RUNNER_TEMP/sync.sh"
+
+      # A pushed sync branch whose PR step failed would otherwise sit unnoticed.
+      - name: Check the pending sync has an open PR
+        if: steps.sync.outputs.status == 'pending_review'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SYNC_BRANCH: ${{ steps.sync.outputs.sync_branch }}
+        run: |
+          n=$(gh pr list -R "$REPO" --head "$SYNC_BRANCH" --state open --json number --jq length)
+          if [ "$n" = "0" ]; then
+            echo "::error::$SYNC_BRANCH exists but has no open PR; open one or delete the branch to retry."
+            exit 1
+          fi
+
+      - name: Package replayed tree
+        if: steps.sync.outputs.status == 'ready'
+        run: git archive --format=tar.gz -o "$RUNNER_TEMP/report/tree.tgz" HEAD
+
+      - uses: actions/upload-artifact@v4
+        if: steps.sync.outputs.status == 'ready'
+        with:
+          name: sync-result
+          path: ${{ runner.temp }}/report/
+          retention-days: 3
+
+      - name: Push branches
+        if: steps.sync.outputs.status == 'ready' && inputs.dry_run != true
+        env:
+          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          TARGET_SHA: ${{ steps.sync.outputs.target_sha }}
+          NEW_BRANCH: ${{ steps.sync.outputs.new_branch }}
+          SYNC_BRANCH: ${{ steps.sync.outputs.sync_branch }}
+        run: |
+          auth=$(printf 'x-access-token:%s' "$SYNC_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          # Atomic and non-forced: an existing branch fails the push instead of being replaced.
+          git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $auth" \
+            push --atomic origin "$TARGET_SHA:refs/heads/$NEW_BRANCH" "HEAD:refs/heads/$SYNC_BRANCH"
+
+  # Runs upstream code, so it gets the replayed tree as a file and no secrets.
+  test:
+    name: Test ${{ matrix.package }}
+    needs: prepare
+    if: needs.prepare.outputs.status == 'ready'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [server, client]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sync-result
+          path: ${{ runner.temp }}/report
+
+      - name: Unpack
+        run: tar -xzf "$RUNNER_TEMP/report/tree.tgz"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Build shared
+        working-directory: shared
+        run: npm ci && npm run build
+
+      - name: Install
+        working-directory: ${{ matrix.package }}
+        run: npm ci --legacy-peer-deps
+
+      - name: Server tests and typecheck
+        if: matrix.package == 'server'
+        working-directory: server
+        run: |
+          npm run test:run
+          npx tsc --noEmit
+
+      - name: Client tests and typecheck
+        if: matrix.package == 'client'
+        working-directory: client
+        run: |
+          npm test
+          npx tsc --noEmit
+
+  pr:
+    name: Open PR
+    needs: [prepare, test]
+    if: always() && needs.prepare.outputs.status == 'ready' && inputs.dry_run != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sync-result
+          path: ${{ runner.temp }}/report
+
+      - name: Open pull request
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          REPO: ${{ github.repository }}
+          TARGET_TAG: ${{ needs.prepare.outputs.target_tag }}
+          NEW_BRANCH: ${{ needs.prepare.outputs.new_branch }}
+          SYNC_BRANCH: ${{ needs.prepare.outputs.sync_branch }}
+          TEST_RESULT: ${{ needs.test.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          body="$RUNNER_TEMP/report/pr-body.md"
+          title="Sync vibeploy patches onto upstream $TARGET_TAG"
+          if [ "$TEST_RESULT" = "success" ]; then
+            printf '\nTests and typecheck passed: %s\n' "$RUN_URL" >>"$body"
+          else
+            title="[tests $TEST_RESULT] $title"
+            printf '\n**Tests or typecheck did not pass (%s):** %s\n' "$TEST_RESULT" "$RUN_URL" >>"$body"
+          fi
+          gh pr create -R "$REPO" --base "$NEW_BRANCH" --head "$SYNC_BRANCH" --title "$title" --body-file "$body"
+          [ "$TEST_RESULT" = "success" ]
